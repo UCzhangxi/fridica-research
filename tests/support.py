@@ -6,7 +6,8 @@ from fridica_research.config import Config, Reviewer
 from fridica_research.machine import Event
 
 OWNER, PEER, REV = "UOWNER", "UPEER", "UREV"
-CFG = Config(owner=OWNER, channels=("C1",), settle_window=60, stage_timeout=3600, reviewers=(Reviewer(REV, "scope"),), people={OWNER: "chengcli", REV: "reviewer"}, require_signoffs=False)
+CFG = Config(owner=OWNER, channels=("C1",), settle_window=60, stage_timeout=1000, reviewers=(Reviewer(REV, "scope"),), audit_scopes=("scope", "code"), people={OWNER: "chengcli", REV: "reviewer"}, require_signoffs=False,
+             projection={"explore": 1200, "claim": 120, "debate": 1200, "implement": 5400, "audit": 5400, "deliver": 600})
 THREAD = "T1:C1:1700000000.000100"
 
 EXPLORER_REPORT = "Findings...\n\n## Approaches\n- alpha: Alpha design -- cheapest\n- beta: Beta design -- robust\n- gamma: Gamma design -- exotic\n"

@@ -57,13 +57,14 @@ class Store:
         return [State.from_dict(json.loads(r[0])) for r in self.db.execute("SELECT state_json FROM studies ORDER BY updated_at")]
 
     def command(self, thread: str, cmd: str | None = None) -> str | None:
-        """Owner commands from the CLI to the serving driver: set with `cmd`, pop with none."""
+        """Owner commands from the CLI to the serving driver: `cmd` appends one; none pops the oldest."""
         key = f"cmd:{thread}"
+        queue = json.loads(self.get_meta(key) or "[]")
         if cmd is not None:
-            self.set_meta(key, cmd)
+            self.set_meta(key, json.dumps(queue + [cmd]))
             return cmd
-        v = self.get_meta(key)
-        if v: self.set_meta(key, None)
-        return v
+        if not queue: return None
+        self.set_meta(key, json.dumps(queue[1:]) if queue[1:] else None)
+        return queue[0]
 
     def close(self): self.db.close()

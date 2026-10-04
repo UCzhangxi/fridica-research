@@ -50,9 +50,10 @@ def test_start_posts_root_and_list_stop_resume(tmp_path, capsys, monkeypatch):
         assert cli.main(["--config", cfgp, "serve", "--once"]) == 0
         assert cli.main(["--config", cfgp, "stop", thread]) == 0
         store = Store(tmp_path / "s.sqlite3")
-        assert store.load(thread).stage == "Explore" and store.get_meta(f"cmd:{thread}") == "stop"
+        assert cli.main(["--config", cfgp, "note", thread, "R99: new rule"]) == 0
+        assert store.load(thread).stage == "Explore" and store.get_meta(f"cmd:{thread}") == '["stop", "note:R99: new rule"]'
         store.close()
         out = capsys.readouterr().out
-        assert "stop queued" in out
+        assert "stop queued" in out and "note queued" in out
     finally:
         server.stop()

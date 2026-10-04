@@ -67,12 +67,13 @@ def implementer(ref: str, problem: str, approach: contracts.Approach, synthesis:
     return fit(sections, findings)
 
 
-def auditor(ref: str, problem: str, synthesis: str, implementer_summary: str, machine_state: dict | None, findings: list[str]) -> str:
+def auditor(ref: str, problem: str, synthesis: str, implementer_summary: str, machine_state: dict | None, findings: list[str], scopes: tuple[str, ...] = ()) -> str:
     ms = json.dumps(machine_state or {}, sort_keys=True)
+    scope = ", ".join(scopes) or "scope"
     return fit([
         ("Study", problem), ("Synthesis the implementer followed", synthesis), ("Implementer summary", implementer_summary),
         ("Checkout", f"machine_state: {ms}\nIf the checkout is not reachable from your workspace, audit the text and say so."),
-        ("Task", "Scope audit: does the delivered work solve the study within scope? Report findings as the role prescribes."),
+        ("Task", f"Audit scope(s): {scope}. Peers audit the other scopes; do not duplicate them. Does the delivered work solve the study within scope, and does it meet the findings noted below? Report findings as the role prescribes."),
         ("Output format", "End the report with a `## Stance` block:\nverdict: pass|return|reject\nnotes: one line per finding that decides the verdict"),
         ("Reference", f"ref: {ref}"),
     ], findings)

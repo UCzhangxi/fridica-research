@@ -25,8 +25,10 @@ def duration(value, default: float) -> float:
 
 @dataclass(frozen=True)
 class Reviewer:
-    handle: str  # Slack user id (U…) or @name
-    focus: str = ""
+    """A peer auditor (R13): the Slack id, the GitHub login that owns the audit card, and the scope they take."""
+    handle: str  # Slack user id (U…)
+    focus: str = ""  # the audit scope this reviewer takes
+    login: str = ""  # GitHub login; empty -> the driver asks in the thread (R8) and leaves the card unassigned
 
 
 @dataclass(frozen=True)
@@ -59,12 +61,24 @@ class Config:
     projection: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_PROJECTION))
     board: Board = field(default_factory=Board)
     reviewers: tuple[Reviewer, ...] = ()
+    audit_scopes: tuple[str, ...] = ()  # all scopes; those no reviewer takes go to a local auditor worker
     require_signoffs: bool = True
     people: dict[str, str] = field(default_factory=dict)  # Slack user id -> GitHub login
     llm_model: str = "haiku"
 
     @property
     def socket_path(self) -> Path: return Path(os.path.expanduser(self.socket))
+
+    def login_of(self, slack_id: str, learned: dict | None = None) -> str:
+        """GitHub login for a Slack id: the reviewer entry, `[people]`, or a login learned in the thread."""
+        for r in self.reviewers:
+            if r.handle == slack_id and r.login: return r.login
+        return self.people.get(slack_id) or (learned or {}).get(slack_id, "")
+
+    def uncovered_scopes(self) -> tuple[str, ...]:
+        """Audit scopes no peer reviewer takes: the local auditor's work (R13). No scopes at all -> one local audit."""
+        taken = {r.focus for r in self.reviewers if r.focus}
+        return tuple(s for s in self.audit_scopes if s not in taken) or (() if self.reviewers else ("scope",))
     @property
     def state_file(self) -> Path: return Path(os.path.expanduser(self.state_path))
 
@@ -78,7 +92,8 @@ def parse(text: str) -> Config:
         proj[k] = duration(v, proj[k])
     b = raw.get("board", {})
     a = raw.get("audit", {})
-    reviewers = tuple(Reviewer(r["handle"] if isinstance(r, dict) else str(r), (r.get("focus", "") if isinstance(r, dict) else "")) for r in a.get("reviewers", []))
+    reviewers = tuple(_reviewer(r) for r in a.get("reviewers", []))
+    scopes = tuple(a.get("scopes", [])) or tuple(dict.fromkeys(r.focus for r in reviewers if r.focus))
     return Config(
         socket=f.get("socket", Config.socket), capability_file=f.get("capability_file"), owner=str(f.get("owner", "")),
         state_path=raw.get("state_path", Config.state_path),
@@ -89,9 +104,14 @@ def parse(text: str) -> Config:
         settle_window=duration(raw.get("settle_window"), 60.0), idle_sleep=duration(raw.get("idle_sleep"), 2.0),
         default_projected_hours=float(raw.get("default_projected_hours", 4.0)), projection=proj,
         board=Board(bool(b.get("enabled", False)), str(b.get("owner", "")), int(b.get("number", 0)), str(b.get("repo", "")), str(b.get("token_env", "GH_TOKEN")), str(b.get("owner_type", "user"))),
-        reviewers=reviewers, require_signoffs=bool(a.get("require_signoffs", True)),
+        reviewers=reviewers, audit_scopes=scopes, require_signoffs=bool(a.get("require_signoffs", True)),
         people={str(k): str(v) for k, v in raw.get("people", {}).items()}, llm_model=str(raw.get("llm_model", "haiku")),
     )
+
+
+def _reviewer(r) -> Reviewer:
+    if not isinstance(r, dict): return Reviewer(str(r))
+    return Reviewer(str(r.get("handle") or r.get("slack") or ""), str(r.get("scope") or r.get("focus") or ""), str(r.get("login", "")))
 
 
 def load(path: str | Path | None = None) -> Config:

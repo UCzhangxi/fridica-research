@@ -72,3 +72,12 @@ def test_bad_projection_stage():
 
 def test_load_missing_file_gives_defaults(tmp_path):
     assert config.load(tmp_path / "none.toml") == config.Config()
+
+
+def test_reviewers_with_login_and_scope_and_uncovered_scopes():
+    c = config.parse('[audit]\nreviewers = [{slack = "U1", login = "alice", scope = "numerics"}, {handle = "U2", focus = "api"}]\nscopes = ["numerics", "api", "docs"]\n[people]\nU2 = "bob"\n')
+    assert [(r.handle, r.focus, r.login) for r in c.reviewers] == [("U1", "numerics", "alice"), ("U2", "api", "")]
+    assert c.audit_scopes == ("numerics", "api", "docs") and c.uncovered_scopes() == ("docs",)
+    assert c.login_of("U1") == "alice" and c.login_of("U2") == "bob" and c.login_of("U3", {"U3": "late"}) == "late" and c.login_of("U9") == ""
+    assert config.parse('[audit]\nreviewers = ["U1"]\n').uncovered_scopes() == ()  # a peer with no scope takes the whole audit
+    assert config.Config().uncovered_scopes() == ("scope",)  # no peers: one local audit

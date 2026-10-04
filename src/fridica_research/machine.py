@@ -26,6 +26,9 @@ from .config import Config
 
 ORDER = ("Explore", "Claim", "Debate", "Implement", "Audit", "Deliver", "Delivered")
 TERMINAL = ("Delivered", "Stopped")
+JOB_STAGES = ("Explore", "Debate", "Implement", "Audit")  # stages with a worker; the 2x-projected overrun rule applies
+STAGE_ROLE = {"Explore": "explorer", "Claim": "driver", "Debate": "debater", "Implement": "implementer", "Audit": "auditor", "Deliver": "driver"}
+OVERRUN_FACTOR = 2.0
 PERSISTENT = ("mathematician", "physicist", "implementer")
 SLOT_CODES = ("too_many_workers", "worker_limit", "too many persistent workers")
 MAX_POST_TRIES = 3
@@ -82,6 +85,7 @@ class State:
     implementer: dict = field(default_factory=dict)  # {summary, machine_state, pr, sha}
     audit: dict = field(default_factory=dict)  # {summary, verdict}
     signoffs: dict = field(default_factory=dict)  # sender -> verdict
+    audit_scopes: dict = field(default_factory=dict)  # scope -> {reviewer (slack id) | None for the local auditor, verdict, signed_at}
     people: dict = field(default_factory=dict)  # sender -> GitHub login learned in-thread
     findings: list = field(default_factory=list)
     deliverable: dict = field(default_factory=dict)
@@ -160,10 +164,21 @@ class M:
         self.close_row()
         self.s.stage, self.s.attempt, self.s.phase, self.s.waiting, self.s.group = stage, 1, "idle", None, None
         if stage in ORDER[:-1]:
-            self.s.stage_log.append({"stage": stage, "start": self.ev.now, "projected": self.cfg.projection[stage.lower()], "end": None, "actual": None})
+            self.s.stage_log.append(self.row(stage))
         elif stage == "Delivered":
             self.s.finished_at = self.ev.now
         self.board()
+
+    def row(self, stage: str) -> dict:
+        return {"stage": stage, "role": STAGE_ROLE[stage], "start": self.ev.now, "projected": self.cfg.projection[stage.lower()], "end": None, "actual": None}
+
+    def arm_overrun(self):
+        """R12: a job stage is interrupted at 2x its projected duration; one timer per stage run, kept across attempts."""
+        s = self.s
+        tid = f"{s.thread}/g{s.generation}/i{s.iteration}/{s.stage}/overrun"
+        if s.stage in JOB_STAGES and tid not in s.timers:
+            s.timers[tid] = s.stage_log[-1]["start"] + OVERRUN_FACTOR * self.cfg.projection[s.stage.lower()]
+            self.emit("arm_timer", tid, deadline=s.timers[tid])
 
     def halt(self, stage: str, reason: str):
         """Blocked (owner-resumable) or Stopped: stop everything, keep the state."""
@@ -191,6 +206,7 @@ class M:
     def enter(self, stage: str):
         s = self.s
         if stage != s.stage: self.set_stage(stage)
+        self.arm_overrun()
         {"Explore": self.enter_explore, "Claim": self.pick, "Debate": self.enter_debate, "Implement": self.enter_implement, "Audit": self.enter_audit, "Deliver": self.enter_deliver}[stage]()
 
     def enter_explore(self):
@@ -268,16 +284,24 @@ class M:
         self.arm("timer", self.cfg.stage_timeout)
 
     def enter_audit(self):
+        """R13: one audit scope per peer reviewer; a local auditor worker only for the scopes no peer takes."""
         s = self.s
         impl = s.implementer
-        asks = [r.handle for r in self.cfg.reviewers if r.handle not in self.cfg.people and r.handle not in s.people]
+        asks = [r.handle for r in self.cfg.reviewers if not self.cfg.login_of(r.handle, s.people)]
         text = briefs.audit_request(self.aid("audit-request"), s.iteration, impl.get("pr", ""), impl.get("sha", ""), [(r.handle, r.focus) for r in self.cfg.reviewers], asks)
         self.emit("post", self.aid("audit-request"), thread=s.thread, post_kind="report", text=text, details=None)
-        brief = briefs.auditor(self.aid("audit"), s.problem, s.synthesis.get("synthesis", ""), impl.get("summary", ""), impl.get("machine_state"), s.findings)
-        action = self.delegate("audit", "auditor", brief, ephemeral=True, backend=self.cfg.auditor_backend)
-        s.phase, s.group, s.signoffs = "job", {"join_groups": [], "jobs": {}, "pending": ["auditor"]}, {}
-        s.waiting = {"kind": "group", "id": self.aid("audit"), "actions": [action]}
+        s.signoffs, s.audit = {}, {}
+        s.audit_scopes = {r.focus or f"review-{r.handle}": {"reviewer": r.handle, "verdict": None, "signed_at": None} for r in self.cfg.reviewers}
+        local = self.cfg.uncovered_scopes()
+        for scope in local: s.audit_scopes[scope] = {"reviewer": None, "verdict": None, "signed_at": None}
         self.arm("timer", self.cfg.stage_timeout)
+        if not local:
+            s.phase, s.waiting, s.group = "signoff", None, None
+            return
+        brief = briefs.auditor(self.aid("audit"), s.problem, s.synthesis.get("synthesis", ""), impl.get("summary", ""), impl.get("machine_state"), s.findings, local)
+        action = self.delegate("audit", "auditor", brief, ephemeral=True, backend=self.cfg.auditor_backend)
+        s.phase, s.group = "job", {"join_groups": [], "jobs": {}, "pending": ["auditor"]}
+        s.waiting = {"kind": "group", "id": self.aid("audit"), "actions": [action]}
 
     def enter_deliver(self):
         s = self.s
@@ -316,7 +340,7 @@ class M:
             if s.stage == "Blocked" and s.control == "active":
                 s.stage, s.blocked_from = s.blocked_from or "Explore", None
                 s.attempt = 1
-                s.stage_log.append({"stage": s.stage, "start": ev.now, "projected": self.cfg.projection[s.stage.lower()], "end": None, "actual": None})
+                s.stage_log.append(self.row(s.stage))
                 self.board()
                 self.enter(s.stage)
             return
@@ -325,7 +349,14 @@ class M:
             return
         if k == "sign_off":
             s.signoffs[ev["sender"]] = ev["verdict"]
+            for sc in s.audit_scopes.values():
+                if sc["reviewer"] == ev["sender"] and sc["signed_at"] is None: sc.update(verdict=ev["verdict"], signed_at=ev.now)
+            self.board()
             if s.stage == "Audit" and s.phase == "signoff": self.check_signoffs()
+            return
+        if k == "finding":
+            # R12: changes that arrive while a stage runs never reach the running worker; they are findings for this iteration.
+            s.findings.append(f"iteration {s.iteration} note during {s.stage}: {ev['text']}")
             return
         if k == "login_reply":
             s.people[ev["sender"]] = ev["login"]
@@ -388,11 +419,28 @@ class M:
         elif suffix == "repost" and s.phase == "post":
             self.repost()
         elif suffix == "timer":
-            if s.stage == "Audit" and s.phase == "signoff":
-                missing = [r.handle for r in self.cfg.reviewers if r.handle not in s.signoffs]
-                s.audit["signoffs_missing"] = missing
-                self.enter("Deliver")
+            if s.stage == "Audit" and s.phase == "signoff": self.deliver_without_signoffs()
             else: self.retry("timeout")
+        elif suffix == "overrun":
+            self.overrun()
+
+    def deliver_without_signoffs(self):
+        s = self.s
+        s.audit["signoffs_missing"] = [sc["reviewer"] for sc in s.audit_scopes.values() if sc["reviewer"] and sc["signed_at"] is None]
+        s.audit.setdefault("verdict", "pass")
+        self.enter("Deliver")
+
+    def overrun(self):
+        """R12: the stage ran 2x its projected time; stop its workers, keep the partial result as a finding, move on."""
+        s = self.s
+        if s.stage == "Audit" and s.phase == "signoff":
+            self.deliver_without_signoffs()
+            return
+        done = [f"{j['role']}: {j['result'].get('summary', '')}" for j in (s.group or {"jobs": {}})["jobs"].values() if j["result"]]
+        partial = "; ".join(done + [f"{r}: {v.get('summary', '')}" for r, v in s.reports.items() if f"{r}:" not in " ".join(done)]) or "none"
+        self.stop_workers(roles=[j["role"] for j in (s.group or {"jobs": {}})["jobs"].values()])
+        elapsed = (self.ev.now - s.stage_log[-1]["start"]) / 60
+        self.next_iteration(f"iteration {s.iteration} {s.stage} interrupted after {elapsed:.0f} min (2x the projected {self.cfg.projection[s.stage.lower()] / 60:.0f} min); partial result: {partial}")
 
     def llm(self, payload: dict):
         s = self.s
@@ -494,11 +542,13 @@ class M:
 
     def check_signoffs(self):
         s = self.s
-        required = [r.handle for r in self.cfg.reviewers] if self.cfg.require_signoffs else []
-        if any(h not in s.signoffs for h in required): return
-        if "changes" in s.signoffs.values():
+        peers = [sc for sc in s.audit_scopes.values() if sc["reviewer"]]
+        if self.cfg.require_signoffs and any(sc["signed_at"] is None for sc in peers): return
+        s.audit.setdefault("verdict", "pass")
+        if any(sc["verdict"] == "changes" for sc in peers):
+            s.audit["verdict"] = "return"
             self.cancel_all()
-            self.next_iteration(f"iteration {s.iteration} peer review asked for changes: " + ", ".join(f"{k}={v}" for k, v in sorted(s.signoffs.items())))
+            self.next_iteration(f"iteration {s.iteration} peer review asked for changes: " + ", ".join(f"{scope}={sc['verdict']}" for scope, sc in sorted(s.audit_scopes.items()) if sc["reviewer"]))
             return
         self.cancel_all()
         self.enter("Deliver")
@@ -577,8 +627,9 @@ def start(thread: str, channel: str, problem: str, now: float, *, generation: in
     s = State(thread, channel, problem, generation=generation, lineage=lineage or thread, spawner=spawner, started_at=now, projected_hours=projected_hours)
     m = M(s, Event("started", now), cfg)
     m.emit("set_driver", m.aid("driver"), thread=thread, driver="external")
-    m.s.stage_log.append({"stage": "Explore", "start": now, "projected": cfg.projection["explore"], "end": None, "actual": None})
+    m.s.stage_log.append(m.row("Explore"))
     m.board()
+    m.arm_overrun()
     m.enter_explore()
     return m.s, m.out
 

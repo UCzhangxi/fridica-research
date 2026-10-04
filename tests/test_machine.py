@@ -13,11 +13,11 @@ from support import CFG, EXPLORER_REPORT, PEER, THREAD, World, report, result
 def test_explore_started_calls_study_brief_then_delegates_explorer():
     w = World()
     w.start()
-    assert [a.kind for a in w.actions[:3]] == ["set_driver", "board_update", "llm_call"]
+    assert [a.kind for a in w.actions[:4]] == ["set_driver", "board_update", "arm_timer", "llm_call"]  # the overrun timer, then the brief
     assert w.kinds("llm_call")[0]["name"] == "study_brief"
     d = w.kinds("delegate")[0]
     assert d["role"] == "explorer" and d["ephemeral"] is True and "ref: " + d.id in d["brief"]
-    assert w.state.stage == "Explore" and w.state.phase == "job" and len(w.kinds("arm_timer")) == 1
+    assert w.state.stage == "Explore" and w.state.phase == "job" and [a.id.rsplit("/", 1)[1] for a in w.kinds("arm_timer")] == ["overrun", "timer"]
 
 
 def test_explore_results_parse_approaches_and_post_claim():
@@ -303,3 +303,52 @@ def test_step_does_not_mutate_input():
     snap = s.to_dict()
     machine.step(s, Event("peer_post", 0, {"ts": "1700000000.000001", "sender": PEER, "kind": "study_claim", "text": "Claim (iteration 1): x\napproach: alpha\nwhy: w\nalso considered: none"}), CFG)
     assert s.to_dict() == snap
+
+
+def test_finding_event_is_recorded_not_injected():
+    """R12: a change that arrives mid-stage becomes a finding; the running worker's brief is untouched."""
+    w = World()
+    w.to_implement()
+    brief_before = w.kinds("delegate")[-1]["brief"]
+    n = len(w.actions)
+    w.ev("finding", text="R99: also support Y")
+    assert w.state.findings == ["iteration 1 note during Implement: R99: also support Y"] and len(w.actions) == n
+    assert w.kinds("delegate")[-1]["brief"] == brief_before
+    w.finish("implementer")
+    assert "R99: also support Y" in w.kinds("delegate")[-1]["brief"]  # the auditor checks against it
+    w.finish("auditor", result(report=report(verdict="return")))
+    assert "R99" in w.kinds("llm_call")[-1]["prompt"]  # and the next iteration's brief carries it
+
+
+def test_overrun_at_2x_projected_interrupts_the_stage():
+    """R12: a job stage past 2x its projected time is interrupted; its partial result is a finding; the loop moves on."""
+    w = World(cfg=dataclasses.replace(CFG, stage_timeout=5000))  # the overrun (2400 s) comes before the stage timer
+    w.to_debate()
+    w.finish("mathematician", result(summary="half done", report=report(position="agree")))
+    w.tick(2 * CFG.projection["debate"])
+    assert w.state.iteration == 2 and w.state.stage == "Explore"
+    assert "Debate interrupted after 40 min (2x the projected 20 min); partial result: mathematician: half done" in w.state.findings[0]
+    assert [a["worker_id"] for a in w.kinds("stop_worker")] == [w.workers["mathematician"], w.workers["physicist"]]
+    assert not any(t.endswith("/i1/Debate/overrun") for t in w.state.timers) and any(t.endswith("/i2/Explore/overrun") for t in w.state.timers)
+
+
+def test_overrun_timer_survives_a_retry():
+    w = World()
+    w.start()
+    w.tick(CFG.stage_timeout)  # attempt 2 at t=1000; the overrun (t=2400) is still armed once
+    assert w.state.attempt == 2 and [t for t in w.state.timers if t.endswith("overrun")] == [f"{THREAD}/g1/i1/Explore/overrun"]
+    w.tick(CFG.stage_timeout)  # t=2000: timer -> Blocked (overrun not yet due)
+    assert w.state.stage == "Blocked"
+
+
+def test_audit_scopes_without_local_auditor_and_peer_changes():
+    """R13: every scope taken by a peer -> no auditor worker; a `changes` sign-off returns the study."""
+    cfg = dataclasses.replace(CFG, audit_scopes=("scope",), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    assert [a["role"] for a in w.kinds("delegate")] == ["explorer", "mathematician", "physicist", "mathematician", "physicist", "implementer"]
+    assert w.state.phase == "signoff" and w.state.audit_scopes == {"scope": {"reviewer": "UREV", "verdict": None, "signed_at": None}}
+    w.ev("sign_off", sender="USOMEONE", pr="p", sha="s", verdict="approve")  # not a reviewer: recorded, no effect
+    assert w.state.stage == "Audit"
+    w.ev("sign_off", sender="UREV", pr="p", sha="s", verdict="changes")
+    assert w.state.iteration == 2 and w.state.audit["verdict"] == "return" and "scope=changes" in w.state.findings[0]

@@ -164,8 +164,9 @@ class Driver:
 
     def commands(self):
         for s in self.store.all():
-            cmd = self.store.command(s.thread)
-            if cmd in ("stop", "resume"): self.apply(s.thread, Event(f"owner_{cmd}", self.clock()))
+            while (cmd := self.store.command(s.thread)) is not None:
+                if cmd in ("stop", "resume"): self.apply(s.thread, Event(f"owner_{cmd}", self.clock()))
+                elif cmd.startswith("note:"): self.apply(s.thread, Event("finding", self.clock(), {"text": cmd[5:]}))
 
     def recover(self):
         """Idempotent restart: confirm or re-send the one waiting action per study."""
