@@ -73,7 +73,54 @@ fridica-research note <thread> "R9: ..."     # a mid-stage change: a finding for
 
 Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/delegate`,
 `/post`, `/workers/<w>/stop`, `threads.driver=external`). The contracts are pinned in
-`contracts.py`; until PR B lands, the package is exercised against the fake server in `tests/`.
+`contracts.py`; until PR B lands, the package is exercised against the fake server in `tests/`
+or run without fridica on the bootstrap backend below.
+
+## Running without fridica: the bootstrap backend
+
+`[backend] kind = "bootstrap"` replaces the control socket with a local feed journal and
+subprocess workers (R15, [docs/protocol.md](docs/protocol.md)). Posts go into
+`<journal_dir>/journal.jsonl` and come back through the same file as the feed; workers are
+`claude -p` (or `codex exec`) runs in a detached git worktree of the subject revision, one per
+worker id. Add to `research.toml`:
+
+```toml
+[backend]
+kind = "bootstrap"                  # fridica (default) | bootstrap
+
+[backend.bootstrap]
+journal_dir = "~/.local/state/fridica-research/journal"   # one study lineage per journal
+# worktrees_dir = "<journal_dir>/worktrees"
+worker = "claude"                   # claude | codex
+subject_repo = "~/src/fridica-research"   # workers run in `git worktree add --detach <worktrees>/<worker id> <subject_revision>`
+subject_revision = "HEAD"
+max_budget_usd_per_job = 5          # claude --max-budget-usd
+max_cost_usd_per_study = 50         # sum of total_cost_usd over the journal; a delegate past it is refused (rule R -> Blocked)
+permission_mode = "bypassPermissions"   # the worker is unattended inside its worktree
+# roles_dir = "~/src/fridica/assets/roles"   # <role>.md appended to the worker's system prompt (R5)
+# retry_backoff = "30s"             # before a re-run of the same ActionId; doubles per retry
+
+[backend.bootstrap.models]          # per role; omitted roles use claude's default
+explorer = "haiku"
+implementer = "opus"
+
+[backend.bootstrap.efforts]         # claude --effort per role
+implementer = "high"
+```
+
+```sh
+fridica-research --config research.toml start C1 "Study X" --projected-hours 3   # the root is line 1 of the journal
+fridica-research --config research.toml serve                                     # reads the journal from line 1, runs the stages
+```
+
+Peers' claims and `SIGN-OFF` lines cannot arrive from Slack on this backend (there is no
+Slack egress or ingress without fridica); with `require_signoffs = true` the audit stage waits
+for the stage timeout, with it false the local auditor worker decides. To try the loop with a
+fake claude, put a `claude` script first on `PATH` that prints one claude result object
+(`{"type": "result", "session_id": ..., "total_cost_usd": 0, "structured_output": {WorkerResult}}`);
+`tests/test_bootstrap_backend.py` does this in-process with a fake runner. The journal and
+the result files are redacted (`sk-`, `ghp_`, `xox[bp]-`, `Bearer` tokens) before they are
+written. The bootstrap backend is frozen after the promotion of R2.
 
 ## Architecture
 
@@ -95,8 +142,9 @@ Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/d
 - `machine.py`: the pure stage machine (claim states, retry rule, debate rounds, follow-on lineage).
 - `contracts.py`: the pinned routes, event shapes and text-line formats (`ref:`, claims, roots, `## Stance`).
 - `briefs.py` + `schemas/`: brief templates and the three LLM JSON schemas, with a size guard.
+- `backend/`: the `DriverBackend` protocol (R15), `fridica.py` over `client.py`, `bootstrap.py` (the feed journal and subprocess workers).
 - `driver.py`, `client.py`, `store.py`, `board.py`, `config.py`, `cli.py`.
-- [docs/protocol.md](docs/protocol.md): the protocol R1-R14 as the driver runs it.
+- [docs/protocol.md](docs/protocol.md): the protocol R1-R15, R19 and R25 as the driver runs it.
 
 ## First study
 
@@ -119,7 +167,9 @@ Tests: the stage table (`test_machine.py`), the physicist's discriminating tests
 (`test_physics.py`: restart equivalence, claim ordering, progress notes, slot refusal, egress-refused
 deliverable), the driver against a fake control server over a Unix socket (`test_driver.py`,
 `fake_control.py`), the board with a fake `gh` (`test_board.py`), config, CLI, contracts, the
-fold-equivalence check (`test_rebuild.py`) and the bootstrap tape.
+fold-equivalence check (`test_rebuild.py`), the bootstrap tape, the replay corpus (`test_replay.py`)
+and the bootstrap backend (`test_bootstrap_backend.py`: swap-equivalence with the fake server on
+corpus 000, the journal's single writer, the 2x kill, the cost ceiling, redaction, session resume).
 
 ## Known limitations
 
@@ -128,3 +178,6 @@ fold-equivalence check (`test_rebuild.py`) and the bootstrap tape.
 - The board never writes Status `Todo`: no card is created ahead of its stage.
 - Slug equivalence across different explorers is by exact name only.
 - Owner-stop does not post a `released` claim; peers keep treating the slug as taken.
+- The bootstrap backend has no Slack: no peer claims or sign-offs arrive, and `backend = "other"`
+  on the auditor delegate is ignored (every worker is the configured `worker`). `codex` workers
+  are not resumed across rounds (no session id up front) and report no cost.

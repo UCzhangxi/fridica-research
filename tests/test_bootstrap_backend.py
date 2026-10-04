@@ -1,0 +1,483 @@
+"""R15: the bootstrap (feed-journal) backend. Swap-equivalence with the fake control server on corpus 000_bootstrap,
+the journal's single writer, the own-post echo through the poll only, the 2x-projection kill, the cost ceiling,
+redaction, deterministic sessions (restart resumes), the retry backoff, and the CLI start/serve flow."""
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+
+from fridica_research import cli, config, contracts, replay
+from fridica_research.backend import build_backend
+from fridica_research.backend.bootstrap import NAMESPACE, BootstrapBackend, Journal, ProcessRunner, next_ts
+from fridica_research.backend.fridica import FridicaBackend
+from fridica_research.backend.protocol import ControlError, Unavailable
+from fridica_research.client import Client
+from fridica_research.driver import Driver
+from fridica_research.machine import Action
+from fridica_research.store import Store
+from fake_control import FakeControl
+from support import CFG, EXPLORER_REPORT, LLM, OWNER, report, result
+from test_bootstrap_tape import BOOTSTRAP, EXPLORE_REPORT, STAGE_MIN, THREAD
+
+ROOT_TEXT = "Bootstrap: implement fridica-research (fridica #126)\n\nprojected: 4 h\ngeneration: 1\nlineage: origin\nref: start"
+PR2 = "https://github.com/chengcli/fridica-research/pull/2"
+ROLE_OF = {"explorer": "explorer", "mathematician": "mathematician", "physicist": "physicist", "impl": "implementer", "audit": "auditor"}
+
+
+class Clock:
+    def __init__(self, t=1_700_000_000.0): self.t = t
+    def __call__(self): return self.t
+
+
+def role_of(argv: list[str]) -> str:
+    """The fake claude learns its role from the `ref:` line of the brief (the last argv entry)."""
+    suffix = (contracts.ref_of(argv[-1]) or "").rsplit("/", 1)[-1]
+    return next(v for k, v in ROLE_OF.items() if k in suffix)
+
+
+def claude_json(payload: dict, argv: list[str], cost=0.01) -> str:
+    sid = argv[argv.index("--session-id") + 1] if "--session-id" in argv else argv[argv.index("--resume") + 1]
+    return json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "num_turns": 1, "total_cost_usd": cost, "structured_output": payload})
+
+
+def payload(res: dict) -> dict:
+    """A scripted WorkerResult as the worker would emit it (the backend fills machine_state from git)."""
+    return {k: res[k] for k in ("status", "summary", "report", "artifacts", "unresolved")}
+
+
+def bootstrap_cfg(tmp_path, base=CFG, **bs) -> config.Config:
+    b = config.Bootstrap(**{"journal_dir": str(tmp_path / "journal"), "retry_backoff": 0.0, **bs})
+    return dataclasses.replace(base, state_path=str(tmp_path / "state.sqlite3"), backend=config.Backend("bootstrap", b))
+
+
+def make_driver(cfg, backend, clock=None, store=None):
+    store = store or Store(cfg.state_file)
+    if store.cursor is None: store.set_cursor(0)
+    return Driver(cfg, backend, store, llm=lambda n, p: LLM[n], clock=clock or Clock(), sleep=lambda s: None)
+
+
+def drain(drv: Driver, limit: int = 12):
+    for _ in range(limit):
+        n, at_end = drv.run_once()
+        if n == 0 and at_end: return
+    raise AssertionError("feed did not settle")
+
+
+def recording(drv: Driver) -> list[dict]:
+    out, orig = [], drv.execute
+    def execute(state, a):
+        out.append(a.to_dict())
+        return orig(state, a)
+    drv.execute = execute
+    return out
+
+
+def git_repo(path: Path) -> str:
+    path.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    (path / "f.txt").write_text("x\n")
+    subprocess.run(["git", "-C", str(path), "add", "f.txt"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-q", "-m", "one"], check=True, env=env)
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+
+
+# -- the scenario of corpus 000_bootstrap, driven through either backend --------------------------------
+class Scripted:
+    """One study through the driver; `finish`/`peer`/`advance` are the points where the two backends are fed the same thing."""
+
+    def __init__(self, cfg, drv: Driver, clock: Clock):
+        self.cfg, self.drv, self.clock = cfg, drv, clock
+        self.actions = recording(drv)
+
+    def advance(self, minutes: float): self.clock.t += minutes * 60
+    def drain(self): drain(self.drv)
+
+
+class ViaFake(Scripted):
+    def __init__(self, cfg, sock, clock, machine_state):
+        self.server = FakeControl(sock, owner=OWNER, workspace="TJ6E2EJ2K").start()
+        cfg = dataclasses.replace(cfg, socket=sock)
+        super().__init__(cfg, make_driver(cfg, FridicaBackend(Client(cfg.socket_path)), clock), clock)
+        self.ms = machine_state
+
+    def root(self): self.server.root(THREAD, OWNER, ROOT_TEXT)
+    def finish(self, role, res): self.server.finish_job(THREAD, self.server.job_of(THREAD, role)["id"], {**res, "machine_state": self.ms, "changes": [], "validation": [], "question": None})
+    def peer(self, sender, text): self.server.message(THREAD, sender, text)
+    def close(self): self.server.stop()
+
+
+class ViaJournal(Scripted):
+    def __init__(self, cfg, clock):
+        self.queues = {r: queue.Queue() for r in ROLE_OF.values()}
+        self.calls: list[tuple[list[str], str, float]] = []
+        def runner(argv, cwd, timeout):
+            self.calls.append((argv, cwd, timeout))
+            return claude_json(self.queues[role_of(argv)].get(), argv), 0  # blocks until the scenario releases this role's result
+        self.backend = BootstrapBackend(cfg, runner=runner, clock=clock, sleep=lambda s: None)
+        super().__init__(cfg, make_driver(cfg, self.backend, clock), clock)
+
+    def root(self):
+        ws, ch, ts = THREAD.split(":")
+        self.backend.journal.append({"kind": "message", "workspace": ws, "channel": {"id": ch, "name": None}, "thread": ts, "ts": ts, "sender": OWNER, "meta": {"kind": "study_root", "status": "complete"}, "turn_kind": "study_root", "text": ROOT_TEXT})
+
+    def finish(self, role, res):
+        job = next(j for j in self.backend.jobs.values() if j["role"] == role and not j["stopped"])
+        self.queues[role].put(payload(res))
+        self.backend.threads[job["job_id"]].join(10)
+
+    def peer(self, sender, text):
+        ws, ch, ts = THREAD.split(":")
+        self.backend.journal.append({"kind": "message", "workspace": ws, "channel": {"id": ch, "name": None}, "thread": ts, "sender": sender, "meta": None, "text": text}, now=self.clock())
+
+    def close(self): pass
+
+
+def kinds_and_ids(actions: list[dict]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for a in actions:
+        pair = (a["kind"], a["id"])
+        if pair[0] == "cancel_timer" and out and out[-1][0] == "cancel_timer":
+            run = [x for x in out[len(out) - next(i for i, x in enumerate(reversed(out)) if x[0] != "cancel_timer"):]] if any(x[0] != "cancel_timer" for x in out) else out[:]
+            del out[len(out) - len(run):]
+            out.extend(sorted(run + [pair]))
+        else: out.append(pair)
+    return out
+
+
+def scenario(p: Scripted, sha: str):
+    """The tape of tests/test_bootstrap_tape.py, through the driver: the same clock advances and worker results on either backend."""
+    p.root()
+    p.drain()
+    p.advance(STAGE_MIN["Explore"])
+    p.finish("explorer", result(report=EXPLORE_REPORT, summary="three package shapes"))
+    p.drain()
+    assert p.drv.store.load(THREAD).claim["slug"] == "pure-machine-sqlite"
+    p.advance(STAGE_MIN["Claim"])
+    p.drain()  # the settle timer (60 s) fired: Debate round 1
+    assert p.drv.store.load(THREAD).stage == "Debate"
+    p.finish("mathematician", result(report=report(position="revised", body="state space, transition table, invariants")))
+    p.finish("physicist", result(report=report(position="revised", body="scales, balances, five tests")))
+    p.drain()
+    p.advance(STAGE_MIN["Debate"])
+    p.finish("mathematician", result(report=report(position="revised", body="concede snapshot store; keep waiting ledger")))
+    p.finish("physicist", result(report=report(position="revised", body="concede snapshot; hold no log")))
+    p.drain()
+    assert p.drv.store.load(THREAD).stage == "Implement"
+    p.advance(STAGE_MIN["Implement"])
+    p.finish("implementer", result(status="done", artifacts=[PR2]))
+    p.drain()
+    s = p.drv.store.load(THREAD)
+    assert s.stage == "Audit" and s.phase == "signoff" and s.implementer["sha"] == sha
+    p.advance(20)
+    p.peer("U_A", f"SIGN-OFF {PR2} {sha} approve")
+    p.drain()
+    p.advance(STAGE_MIN["Audit"] - 20)
+    p.peer("U_B", f"SIGN-OFF {PR2} {sha} approve")
+    p.peer("U_C", f"SIGN-OFF {PR2} {sha} approve")
+    p.drain()
+    s = p.drv.store.load(THREAD)
+    assert s.stage == "Delivered" and s.followon and p.drv.store.load(s.followon).stage == "Explore"
+    return [a for a in p.actions if a["id"].startswith(THREAD + "/")]
+
+
+def test_swap_equivalence_on_corpus_000_bootstrap(tmp_path, sock_dir):
+    sha = git_repo(tmp_path / "subject")
+    cfg = dataclasses.replace(BOOTSTRAP, board=config.Board(), state_path=str(tmp_path / "a.sqlite3"))
+    a = ViaFake(cfg, os.path.join(sock_dir, "c.sock"), Clock(1791125606.0), {"branch": "HEAD", "commit": sha, "dirty": False})
+    try: via_fake = scenario(a, sha)
+    finally: a.close()
+    bcfg = bootstrap_cfg(tmp_path, cfg, subject_repo=str(tmp_path / "subject"), workspace="TJ6E2EJ2K")
+    b = ViaJournal(bcfg, Clock(1791125606.0))
+    via_journal = scenario(b, sha)
+    assert [replay.pi_struct(x) for x in via_journal] == [replay.pi_struct(x) for x in via_fake]
+    assert via_journal == via_fake  # byte-equal as well: same ids, same worker ids, same texts
+    # The corpus recorded from `World` (tests/record_corpora.py) has the same action kinds and ids as either driver path, up to the
+    # order of simultaneous `cancel_timer`s (the driver's snapshot round-trips through sort_keys JSON, so `cancel_all` runs in key order).
+    expected = [json.loads(line) for line in (replay.corpora(Path(__file__).parent / "bootstrap" / "000_bootstrap")[0] / "expected_actions.jsonl").read_text().splitlines()]
+    assert kinds_and_ids(via_journal) == kinds_and_ids(expected)
+    # Every worker ran from a detached worktree of the subject revision, one per worker id, reused across rounds (the 7th call is the follow-on child's explorer).
+    cwds = {c[1] for c in b.calls}
+    assert len(b.calls) == 7 and len(cwds) == 5 and len({c[1] for c in b.calls[:6]}) == 4 and all(Path(c).parent == Path(bcfg.backend.bootstrap.journal_dir) / "worktrees" for c in cwds)
+    assert all(subprocess.run(["git", "-C", c, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip() == sha for c in cwds)
+    # The echo of every own post arrived through the poll with a cursor and a fixed-width ts, never synthesised in execute.
+    msgs = [r for r in b.backend.journal.all() if r["kind"] == "message" and r["sender"] == OWNER]
+    assert all(r["cursor"] == r["seq"] and len(r["ts"].split(".")[1]) == 6 for r in msgs)
+    assert [m["meta"]["kind"] for m in msgs] == ["study_root", "study_claim", "report", "study_result", "study_root"]
+    jr = [r for r in b.backend.journal.all() if r["kind"] == "job_result"]
+    assert [r["role"] for r in jr] == ["explorer", "mathematician", "physicist", "mathematician", "physicist", "implementer"] and all(r["total_cost_usd"] == 0.01 for r in jr)
+    assert b.backend.spent() == 0.06
+
+
+# -- journal invariants ----------------------------------------------------------------------------------
+WRITER = """
+import sys, json
+from fridica_research.backend.bootstrap import Journal
+j = Journal(sys.argv[1])
+for i in range(int(sys.argv[3])): j.append({"kind": "message", "writer": sys.argv[2], "i": i, "text": sys.argv[2] * 6000}, now=1.0)
+"""
+
+
+def test_journal_single_writer_two_processes_never_interleave(tmp_path):
+    procs = [subprocess.Popen([sys.executable, "-c", WRITER, str(tmp_path), w, "120"]) for w in ("a", "b")]
+    assert [p.wait(120) for p in procs] == [0, 0]
+    rows = Journal(tmp_path).all()  # a seq gap or an unparseable line raises
+    assert [r["seq"] for r in rows] == list(range(1, 241)) and all(r["text"] == r["writer"] * 6000 for r in rows)
+    assert sorted(r["writer"] for r in rows).count("a") == 120
+
+
+def test_journal_reader_stops_on_a_seq_gap(tmp_path):
+    j = Journal(tmp_path)
+    j.append({"kind": "x"})
+    j.append({"kind": "x"})
+    rows = j.path.read_text().splitlines()
+    j.path.write_text(rows[0] + "\n" + rows[1].replace('"seq": 2', '"seq": 3') + "\n")
+    with pytest.raises(Unavailable): j.all()
+
+
+def test_ts_is_fixed_width_and_strictly_increasing():
+    assert next_ts(None, 1700.9) == "1700.000000"
+    assert next_ts("1700.000000", 1700.0) == "1700.000001"
+    assert next_ts("1700.999999", 1700.0) == "1701.000000"
+    assert next_ts("1700.000005", 1650.0) == "1700.000006"  # the clock moved back: still after the last line
+    assert next_ts("1700.000005", 1800.0) == "1800.000000"
+
+
+def test_own_post_echo_arrives_only_through_events(tmp_path):
+    cfg = bootstrap_cfg(tmp_path)
+    def running_forever(argv, cwd, timeout):  # the explorer stays running for the whole test
+        threading.Event().wait(10)
+        return "", None
+    backend = BootstrapBackend(cfg, runner=running_forever, sleep=lambda s: None)
+    drv = make_driver(cfg, backend)
+    thread = backend.post("C1", contracts.PostRequest("study_root", "Study\n\nprojected: 1 h\ngeneration: 1\nlineage: origin\nref: r"))["thread"]
+    drain(drv)
+    state = drv.store.load(thread)
+    assert state.stage == "Explore"
+    cursor = drv.store.cursor
+    assert drv.execute(state, Action("post", "x/claim", {"thread": thread, "post_kind": "study_claim", "text": "Claim\nref: x/claim", "details": None})) == []  # no synthesised follow event
+    page = backend.events(cursor)["events"]
+    assert len(page) == 1 and page[0]["cursor"] == cursor + 1 and page[0]["text"] == "Claim\nref: x/claim" and page[0]["meta"]["kind"] == "study_claim" and page[0]["sender"] == OWNER
+    assert drv.thread_view(thread).own_post_with_ref("x/claim", OWNER)["ts"] == page[0]["ts"]
+
+
+# -- bounds: the 2x-projection kill, the cost ceiling, the backoff --------------------------------------
+def test_kill_at_twice_the_stage_projection_through_the_driver(tmp_path):
+    cfg = bootstrap_cfg(tmp_path, dataclasses.replace(CFG, projection={**CFG.projection, "explore": 1}))
+    seen = []
+    def sleeper(argv, cwd, timeout):
+        seen.append(timeout)
+        time.sleep(min(timeout, 5))
+        return "", None  # the ProcessRunner's answer after os.killpg at the deadline
+    backend = BootstrapBackend(cfg, runner=sleeper, sleep=lambda s: None)
+    drv = make_driver(cfg, backend)
+    thread = backend.post("C1", contracts.PostRequest("study_root", "Study\n\nprojected: 1 h\ngeneration: 1\nlineage: origin\nref: r"))["thread"]
+    drain(drv)
+    backend.join(10)
+    drain(drv)
+    assert seen[0] == 2.0  # OVERRUN_FACTOR x projection["explore"]
+    jr = [r for r in backend.journal.all() if r["kind"] == "job_result"]
+    assert jr[0]["job_status"] == "interrupted" and jr[0]["code"] == "timeout" and jr[0]["result"] is None
+    s = drv.store.load(thread)
+    assert s.attempt == 2 and s.stage == "Explore"  # rule R re-ran the stage (a new ActionId, attempt 1 of it: no backoff)
+    assert len(seen) == 2 and (Path(cfg.backend.bootstrap.journal_dir) / "results").glob("*.json")
+
+
+def test_process_runner_kills_the_process_group_at_the_deadline(tmp_path):
+    t0 = time.monotonic()
+    out, rc = ProcessRunner()(["sh", "-c", "sleep 30 & sleep 30"], str(tmp_path), 0.3)
+    assert rc is None and time.monotonic() - t0 < 5
+
+
+def test_process_runner_returns_stdout_and_exit_code(tmp_path):
+    assert ProcessRunner()(["sh", "-c", "echo hi; exit 3"], str(tmp_path), 5) == ("hi\n", 3)
+
+
+def test_cost_ceiling_refuses_a_delegate(tmp_path):
+    cfg = bootstrap_cfg(tmp_path, max_budget_usd_per_job=5.0, max_cost_usd_per_study=4.0)
+    backend = BootstrapBackend(cfg, runner=lambda a, c, t: ("", 0), sleep=lambda s: None)
+    with pytest.raises(ControlError) as e: backend.delegate("journal:C1:1.000000", contracts.DelegateRequest("explorer", "b\nref: t/g1/i1/Explore/a1/explorer", tags=("t/g1/i1/Explore/a1/explorer",)))
+    assert (e.value.status, e.value.code) == (429, "budget_exceeded")
+    # Through the driver: the refusal is rule R, the second refusal Blocks the study.
+    drv = make_driver(cfg, backend)
+    thread = backend.post("C1", contracts.PostRequest("study_root", "Study\n\nprojected: 1 h\ngeneration: 1\nlineage: origin\nref: r"))["thread"]
+    drain(drv)
+    s = drv.store.load(thread)
+    assert s.stage == "Blocked" and s.attempt == 2 and not [r for r in backend.journal.all() if r["kind"] == "job"]
+
+
+def test_cost_accumulates_from_total_cost_usd(tmp_path):
+    cfg = bootstrap_cfg(tmp_path, max_budget_usd_per_job=1.0, max_cost_usd_per_study=2.5)
+    def runner(argv, cwd, timeout): return claude_json(payload(result(report="r")), argv, cost=1.25), 0
+    backend = BootstrapBackend(cfg, runner=runner, sleep=lambda s: None)
+    thread = "journal:C1:1.000000"
+    for i in range(2):
+        backend.delegate(thread, contracts.DelegateRequest("explorer", f"b\nref: t/g1/i1/Explore/a{i}/explorer", tags=(f"t/g1/i1/Explore/a{i}/explorer",)))
+        backend.join(10)
+        backend.events(0)
+    assert backend.spent() == 2.5
+    with pytest.raises(ControlError): backend.delegate(thread, contracts.DelegateRequest("explorer", "b\nref: t/g1/i1/Explore/a3/explorer", tags=("t/g1/i1/Explore/a3/explorer",)))
+
+
+def test_retry_of_a_seen_action_id_backs_off_exponentially(tmp_path):
+    cfg = bootstrap_cfg(tmp_path, retry_backoff=30.0)
+    slept = []
+    backend = BootstrapBackend(cfg, runner=lambda a, c, t: ("", 1), sleep=slept.append)
+    aid = "t/g1/i1/Explore/a1/explorer"
+    for _ in range(4):
+        backend.delegate("journal:C1:1.000000", contracts.DelegateRequest("explorer", f"b\nref: {aid}", tags=(aid,)))
+        backend.join(10)
+    assert slept == [30.0, 60.0, 120.0]
+    assert [r["attempt"] for r in backend.journal.all() if r["kind"] == "job"] == [1, 2, 3, 4]
+
+
+# -- redaction, sessions, restart -----------------------------------------------------------------------
+def test_everything_written_to_the_journal_is_redacted(tmp_path):
+    cfg = bootstrap_cfg(tmp_path)
+    def runner(argv, cwd, timeout): return claude_json(payload(result(report="token xoxb-1234567890 and Bearer abcdef0123")), argv), 0
+    backend = BootstrapBackend(cfg, runner=runner, sleep=lambda s: None)
+    thread = backend.post("C1", contracts.PostRequest("study_root", "root sk-abcdefghijkl\n\nref: r", details="ghp_ABCDEFGH1234"))["thread"]
+    backend.delegate(thread, contracts.DelegateRequest("explorer", "brief with xoxp-999999999\nref: t/g1/i1/Explore/a1/explorer", tags=("t/g1/i1/Explore/a1/explorer",)))
+    backend.join(10)
+    page = backend.events(0)["events"]
+    assert page[0]["text"] == "root [redacted]\n\nref: r" and page[0]["details"] == "[redacted]"
+    assert page[1]["brief"] == "brief with [redacted]\nref: t/g1/i1/Explore/a1/explorer"
+    assert page[2]["result"]["report"] == "token [redacted] and [redacted]"
+    assert not replay.TOKEN.search(backend.journal.path.read_text())
+    assert not any(replay.TOKEN.search(f.read_text()) for f in (Path(cfg.backend.bootstrap.journal_dir) / "results").iterdir())
+
+
+def test_restart_resumes_the_same_worker_session(tmp_path):
+    cfg = bootstrap_cfg(tmp_path)
+    calls = []
+    def runner(argv, cwd, timeout):
+        calls.append(argv)
+        return claude_json(payload(result(report="r")), argv), 0
+    aid = "t/g1/i1/Debate/a1/debate-1-mathematician"
+    b1 = BootstrapBackend(cfg, runner=runner, sleep=lambda s: None)
+    r = b1.delegate("journal:C1:1.000000", contracts.DelegateRequest("mathematician", f"b\nref: {aid}", tags=(aid,)))
+    b1.join(10)
+    sid = str(uuid.uuid5(NAMESPACE, aid))
+    assert calls[0][calls[0].index("--session-id") + 1] == sid and "--resume" not in calls[0]
+    b2 = BootstrapBackend(cfg, runner=runner, sleep=lambda s: None)  # a restarted driver: the restart probe re-sends the same ActionId
+    b2.delegate("journal:C1:1.000000", contracts.DelegateRequest("mathematician", f"b\nref: {aid}", tags=(aid,)))
+    b2.join(10)
+    assert calls[1][calls[1].index("--resume") + 1] == sid and "--session-id" not in calls[1]
+    # A later job for the same persistent worker (round 2) resumes that worker's session too.
+    aid2 = "t/g1/i1/Debate/a1/debate-2-mathematician"
+    b2.delegate("journal:C1:1.000000", contracts.DelegateRequest("mathematician", f"b\nref: {aid2}", worker_id=r["jobs"][0]["worker_id"], tags=(aid2,)))
+    b2.join(10)
+    assert calls[2][calls[2].index("--resume") + 1] == sid
+    argv = calls[0]
+    assert argv[:4] == ["claude", "-p", "--output-format", "json"] and "--json-schema" in argv and argv[argv.index("--max-budget-usd") + 1] == "5" and argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+
+
+def test_restart_adopts_a_running_job_and_applies_a_result_file(tmp_path):
+    """The result file keyed by ActionId is durable: a driver restarted after the worker finished finds the job done through the thread view."""
+    cfg = bootstrap_cfg(tmp_path)
+    gate = threading.Event()
+    def runner(argv, cwd, timeout):
+        gate.wait(10)
+        return claude_json(payload(result(report=EXPLORER_REPORT)), argv), 0
+    backend = BootstrapBackend(cfg, runner=runner, sleep=lambda s: None)
+    drv = make_driver(cfg, backend)
+    thread = backend.post("C1", contracts.PostRequest("study_root", "Study\n\nprojected: 1 h\ngeneration: 1\nlineage: origin\nref: r"))["thread"]
+    drain(drv)
+    s = drv.store.load(thread)
+    assert s.stage == "Explore" and drv.thread_view(thread).jobs_with_ref(s.waiting["actions"][0]["action_id"])[0]["job_status"] == "running"
+    gate.set()
+    backend.join(10)  # the worker finished and its result file was written, but the driver died before the journal line
+    drv2 = make_driver(cfg, BootstrapBackend(cfg, runner=runner, sleep=lambda s: None), store=Store(cfg.state_file))
+    drain(drv2)
+    s2 = drv2.store.load(thread)
+    assert s2.stage == "Claim" and len([r for r in drv2.backend.journal.all() if r["kind"] == "job"]) == 1  # adopted and finished, never re-delegated
+
+
+def test_stop_interrupts_the_worker(tmp_path):
+    cfg = bootstrap_cfg(tmp_path)
+    killed = []
+    class R:
+        def __call__(self, argv, cwd, timeout):
+            time.sleep(0.2)
+            return "", None
+        def kill(self, argv): killed.append(argv[0])
+    backend = BootstrapBackend(cfg, runner=R(), sleep=lambda s: None)
+    drv = make_driver(cfg, backend)
+    thread = backend.post("C1", contracts.PostRequest("study_root", "Study\n\nprojected: 1 h\ngeneration: 1\nlineage: origin\nref: r"))["thread"]
+    drain(drv)
+    drv.store.command(thread, "stop")
+    drain(drv)
+    backend.join(10)
+    drain(drv)
+    s = drv.store.load(thread)
+    jr = [r for r in backend.journal.all() if r["kind"] == "job_result"]
+    assert s.stage == "Stopped" and killed == ["claude"] and len(jr) == 1 and (jr[0]["job_status"], jr[0]["code"]) == ("interrupted", "stopped")
+
+
+def test_schema_and_exit_failures_are_failed_jobs(tmp_path):
+    cfg = bootstrap_cfg(tmp_path)
+    answers = iter([("not json", 0), ('{"type":"result","is_error":true,"result":"x"}', 0), (claude_json({"status": "done"}, ["--session-id", "s"]), 0), ("", 7)])
+    backend = BootstrapBackend(cfg, runner=lambda a, c, t: next(answers), sleep=lambda s: None)
+    for i in range(4):
+        backend.delegate("journal:C1:1.000000", contracts.DelegateRequest("explorer", f"b\nref: t/g1/i1/Explore/a{i}/explorer", tags=(f"t/g1/i1/Explore/a{i}/explorer",)))
+        backend.join(10)
+    backend.events(0)
+    assert [(r["job_status"], r["code"]) for r in backend.journal.all() if r["kind"] == "job_result"] == [("failed", "schema"), ("failed", "is_error"), ("failed", "schema"), ("failed", "exit 7")]
+
+
+def test_codex_argv_and_result_file(tmp_path):
+    cfg = bootstrap_cfg(tmp_path, worker="codex", models={"explorer": "gpt-5-codex"})
+    def runner(argv, cwd, timeout):
+        Path(argv[argv.index("--output-last-message") + 1]).write_text(json.dumps(payload(result(report="codex report"))))
+        return "", 0
+    backend = BootstrapBackend(cfg, runner=runner, sleep=lambda s: None)
+    backend.delegate("journal:C1:1.000000", contracts.DelegateRequest("explorer", "b\nref: t/g1/i1/Explore/a1/explorer", tags=("t/g1/i1/Explore/a1/explorer",)))
+    backend.join(10)
+    backend.events(0)
+    jr = [r for r in backend.journal.all() if r["kind"] == "job_result"][0]
+    job = backend.jobs if False else [r for r in backend.journal.all() if r["kind"] == "job"][0]
+    assert jr["job_status"] == "finished" and jr["result"]["report"] == "codex report" and job["backend"] == "codex"
+
+
+# -- config and the CLI flow ----------------------------------------------------------------------------
+def test_backend_config_parses_and_round_trips():
+    c = config.parse('[backend]\nkind = "bootstrap"\n[backend.bootstrap]\njournal_dir = "/tmp/j"\nworktrees_dir = "/tmp/w"\nworker = "codex"\nmax_budget_usd_per_job = 2\nmax_cost_usd_per_study = 20\nsubject_repo = "."\nretry_backoff = "1m"\n[backend.bootstrap.models]\nexplorer = "sonnet"\nimplementer = "opus"\n[backend.bootstrap.efforts]\nimplementer = "high"\n')
+    b = c.backend
+    assert b.kind == "bootstrap" and b.bootstrap.journal_dir == "/tmp/j" and b.bootstrap.worktrees_dir == "/tmp/w" and b.bootstrap.worker == "codex"
+    assert b.bootstrap.models == {"explorer": "sonnet", "implementer": "opus"} and b.bootstrap.efforts == {"implementer": "high"}
+    assert b.bootstrap.max_budget_usd_per_job == 2 and b.bootstrap.max_cost_usd_per_study == 20 and b.bootstrap.subject_repo == "." and b.bootstrap.retry_backoff == 60
+    assert config.Config.from_dict(c.to_dict()) == c and config.parse("").backend == config.Backend()
+    with pytest.raises(ValueError): config.parse('[backend]\nkind = "slack"\n')
+    with pytest.raises(ValueError): config.parse('[backend]\nkind = "bootstrap"\n[backend.bootstrap]\nworker = "gemini"\n')
+    assert isinstance(build_backend(config.parse("")), FridicaBackend) and isinstance(build_backend(dataclasses.replace(c, backend=config.Backend("bootstrap", config.Bootstrap(journal_dir="/tmp/fr-test-journal")))), BootstrapBackend)
+
+
+def test_cli_start_then_serve_with_the_bootstrap_backend(tmp_path, monkeypatch, capsys):
+    """`fridica-research start` writes the root into the journal; `serve --once` reads it from line 1 and delegates the explorer."""
+    monkeypatch.setattr(cli, "claude_runner", lambda model: (lambda name, prompt: LLM[name]))
+    calls = []
+    class FakeProcessRunner:
+        def __call__(self, argv, cwd, timeout):
+            calls.append(argv)
+            return claude_json(payload(result(report=EXPLORER_REPORT)), argv), 0
+    monkeypatch.setattr("fridica_research.backend.bootstrap.ProcessRunner", FakeProcessRunner)
+    p = tmp_path / "research.toml"
+    p.write_text(f'channels = ["C1"]\nstate_path = "{tmp_path / "s.sqlite3"}"\n[fridica]\nowner = "{OWNER}"\n[backend]\nkind = "bootstrap"\n[backend.bootstrap]\njournal_dir = "{tmp_path / "journal"}"\n')
+    assert cli.main(["--config", str(p), "start", "C1", "Study X", "--projected-hours", "2"]) == 0
+    assert "posted study root to C1" in capsys.readouterr().out
+    assert cli.main(["--config", str(p), "serve", "--once"]) == 0
+    store = Store(tmp_path / "s.sqlite3")
+    studies = store.all()
+    assert len(studies) == 1 and studies[0].stage == "Explore" and studies[0].thread.startswith("journal:C1:") and studies[0].projected_hours == 2
+    assert len(calls) == 1 and calls[0][0] == "claude" and "ref: " + studies[0].waiting["actions"][0]["action_id"] in calls[0][-1]
+    assert cli.main(["--config", str(p), "list"]) == 0
