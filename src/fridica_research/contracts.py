@@ -269,8 +269,18 @@ def pr_body(summary: str, closes: int | None, thread: str, board_url: str, miles
 
 def pr_hygiene_missing(body: str) -> list[str]:
     """The R23 lines a PR body lacks; the driver refuses to open a PR while this is non-empty."""
-    checks = (("Closes #N", r"^Closes #\d+\s*$"), ("study thread", r"^Study thread: \S+"), ("board link", r"^Board: https://github\.com/\S+"), ("milestone", r"^Milestone: R\d+\s*$"))
-    return [name for name, rx in checks if not re.search(rx, body, re.M)]
+    return [name for name, rx in _HYGIENE if not re.search(rx, body, re.M | re.I)]
+
+
+# The study line, the board link and the milestone each on its own line (`pr_body`), or sharing one line
+# ("Study: Slack study thread <ts>, board <url>, milestone R2").
+_MILESTONE = r"(?:^Milestone:|\bmilestone) (R\d+)\b"
+_HYGIENE = (("Closes #N", r"^Closes #\d+\s*$"), ("study thread", r"^(?:Study thread: \S+|Study:.*\bstudy thread \S+)"), ("board link", r"(?:^Board:|\bboard) https://github\.com/\S+"), ("milestone", _MILESTONE))
+
+
+def pr_milestone(body: str) -> str:
+    """The generation milestone (`R<n>`) a hygienic PR body names."""
+    return re.search(_MILESTONE, body, re.M | re.I).group(1).upper()
 
 
 _LOGIN = re.compile(r"^\s*(?:(?:github|login)(?: login)?:\s*)?@?(?P<login>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\s*$")

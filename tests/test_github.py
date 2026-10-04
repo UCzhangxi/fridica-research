@@ -8,7 +8,7 @@ import os
 import pytest
 
 from fridica_research import board, config, contracts, machine, replay
-from fridica_research.client import Client
+from fridica_research.client import Client, ControlError
 from fridica_research.config import Board as BoardCfg
 from fridica_research.config import GitHub as GitHubCfg
 from fridica_research.config import Repo, Reviewer
@@ -16,7 +16,7 @@ from fridica_research.driver import Driver
 from fridica_research.github import GitHub, PrHygieneError, parse_iso
 from fridica_research.store import Store
 from fake_control import FakeControl
-from support import CFG, LLM, OWNER, PR, REV, SHA, World
+from support import CFG, LLM, OWNER, PR, REV, SHA, World, result
 
 HEAD = SHA + "0" * 33  # the PR's full head; the implementer reported the short sha
 OLD = "0123456" + "f" * 33
@@ -29,26 +29,53 @@ GCFG = dataclasses.replace(
 )
 
 
-def rv(rid, login, state, oid=HEAD, at="2026-10-04T10:00:00Z", body=""):
-    return {"id": rid, "author": {"login": login}, "state": state, "commit": {"oid": oid}, "submittedAt": at, "body": body}
+def rv(rid, login, state, oid=HEAD, at="2026-10-04T10:00:00Z", body="", typ="User"):
+    """A review as `gh api repos/<o>/<r>/pulls/<n>/reviews` returns it (the shape of chengcli/fridica-research#18's)."""
+    return {"author_association": "COLLABORATOR", "body": body, "commit_id": oid, "id": rid, "state": state, "submitted_at": at, "user": {"login": login, "type": typ}}
+
+
+def latest_review(r: dict) -> dict:
+    """The same review as `gh pr view --json latestReviews` returns it: the id and the commit oid are empty strings."""
+    return {"id": "", "author": {"login": r["user"]["login"]}, "authorAssociation": r["author_association"], "body": r["body"], "submittedAt": r["submitted_at"], "includesCreatedEdit": False, "reactionGroups": [], "state": r["state"], "commit": {"oid": ""}}
 
 
 class FakeGh:
-    """Answers the gh calls of github.py from a table of PR views; records (argv, parsed stdin)."""
+    """Answers the gh calls of github.py with real gh output shapes from a table of PRs; records (argv, parsed stdin).
+
+    `reviews` is the REST list (paginated two per page, pages printed back to back as `gh api --paginate` does);
+    `gh pr view` answers only the requested `--json` fields, `latestReviews` in its real shape (empty id and oid)."""
 
     def __init__(self, *prs: tuple[str, dict]):
-        self.prs = {contracts.pr_id(url): {"latestReviews": [], "headRefOid": HEAD, "state": "OPEN", "mergedAt": None, "mergeCommit": None, "author": {"login": "implementer"}, "milestone": None, **v} for url, v in prs}
+        self.prs = {contracts.pr_id(url): {"reviews": [], "headRefOid": HEAD, "state": "OPEN", "mergedAt": None, "mergeCommit": None, "author": {"login": "implementer"}, "milestone": None, **v} for url, v in prs}
         self.calls: list[tuple[list[str], dict | None]] = []
         self.milestones: dict[str, list[dict]] = {}
+        self.opened: dict[str, str] = {}  # head branch -> PR url
+        self.failures: list[tuple] = []  # (predicate on argv, error text), each raised once
+        self.refuse: set[str] = set()  # logins GitHub answers 422 for
+
+    def fail_once(self, pred, text="HTTP 502"): self.failures.append((pred, text))
 
     def __call__(self, argv: list[str], stdin: str | None) -> str:
         doc = json.loads(stdin) if stdin else None
         self.calls.append((argv, doc))
-        if argv[:3] == ["gh", "pr", "view"]: return json.dumps(self.prs[(argv[argv.index("-R") + 1], argv[3])])
+        for f in self.failures:
+            if f[0](argv):
+                self.failures.remove(f)
+                raise RuntimeError(f"{' '.join(argv[:3])} failed: {f[1]}")
+        if argv[:3] == ["gh", "pr", "view"]:
+            pr = self.prs[(argv[argv.index("-R") + 1], argv[3])]
+            full = {**pr, "latestReviews": [latest_review(r) for r in pr["reviews"]], "reviewDecision": "APPROVED" if any(r["state"] == "APPROVED" for r in pr["reviews"]) else ""}
+            return json.dumps({k: full[k] for k in argv[argv.index("--json") + 1].split(",")})
         if argv[:3] == ["gh", "pr", "merge"]:
             self.prs[(argv[argv.index("-R") + 1], argv[3])].update(state="MERGED", mergedAt=MERGED_AT, mergeCommit={"oid": SQUASH})
             return ""
-        if argv[:3] == ["gh", "pr", "create"]: return f"https://github.com/{argv[argv.index('-R') + 1]}/pull/13\n"
+        if argv[:3] == ["gh", "pr", "create"]:
+            url = f"https://github.com/{argv[argv.index('-R') + 1]}/pull/{13 + len(self.opened)}"
+            self.opened[argv[argv.index("--head") + 1]] = url
+            return url + "\n"
+        if argv[:3] == ["gh", "pr", "list"]:
+            url = self.opened.get(argv[argv.index("--head") + 1])
+            return json.dumps([{"url": url}] if url else [])
         if argv[:3] == ["gh", "api", "graphql"]:
             q, v = doc["query"], doc["variables"]
             if q == board.Q_DISCOVER["user"]: return json.dumps({"data": {"user": {"projectV2": {"id": "PVT_1", "fields": {"nodes": []}}}}})
@@ -62,6 +89,12 @@ class FakeGh:
                 ms.append({"title": doc["title"], "number": len(ms) + 1})
                 return json.dumps(ms[-1])
             if "/milestones?" in path: return json.dumps(self.milestones.get(path.split("?")[0], []))
+            if "/reviews?" in path and "--paginate" in argv:
+                parts = path.split("?")[0].split("/")  # repos/<o>/<r>/pulls/<n>/reviews
+                rs = self.prs[("/".join(parts[1:3]), parts[4])]["reviews"]
+                return "".join(json.dumps(rs[i:i + 2]) for i in range(0, len(rs), 2)) or "[]"
+            if path.endswith("/requested_reviewers") and set(doc["reviewers"]) & self.refuse:
+                raise RuntimeError("gh api -X failed: Reviews may only be requested from collaborators. One or more of the users or teams you specified is not a collaborator of the o/r repository. (HTTP 422)")
             return "{}"
         raise AssertionError(argv)
 
@@ -82,9 +115,7 @@ def audit_world(cfg=GCFG, pr=PR) -> World:
 
 
 def poll(gh_client: GitHub, w: World, now: float | None = None):
-    out = gh_client.poll(w.state, now if now is not None else w.now)
-    for ev in out.events: w.feed(ev)
-    return out
+    return gh_client.poll(w.state, now if now is not None else w.now, lambda item: [w.feed(ev) for ev in item.events])
 
 
 # -- R21: reviews as sign-offs -----------------------------------------------------------
@@ -103,7 +134,7 @@ def test_review_requests_go_through_rest_once_per_head_never_to_the_author():
 
 
 def test_copilot_approved_is_ignored():
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "copilot-pull-request-reviewer", "APPROVED"), rv("R2", "dependabot[bot]", "APPROVED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "copilot-pull-request-reviewer", "APPROVED"), rv(2, "dependabot[bot]", "APPROVED")]}))
     g, _ = make(gh)
     w = audit_world()
     out = poll(g, w)
@@ -112,7 +143,7 @@ def test_copilot_approved_is_ignored():
 
 
 def test_approval_on_an_old_head_is_ignored():
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "APPROVED", oid=OLD)]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED", oid=OLD)]}))
     g, _ = make(gh)
     w = audit_world()
     out = poll(g, w)
@@ -121,7 +152,7 @@ def test_approval_on_an_old_head_is_ignored():
 
 
 def test_approval_on_the_head_closes_the_card_and_merges_with_the_squash_sha():
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "Reviewer", "APPROVED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "Reviewer", "APPROVED")]}))
     g, meta = make(gh)
     w = audit_world()
     out = poll(g, w)
@@ -136,29 +167,29 @@ def test_approval_on_the_head_closes_the_card_and_merges_with_the_squash_sha():
 
 def test_merge_only_for_driver_repos_and_only_without_changes_on_the_head():
     owner_cfg = dataclasses.replace(GCFG, repos=(Repo("o/r", "owner"),))
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "APPROVED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
     g, _ = make(gh, owner_cfg)
     w = audit_world(owner_cfg)
     out = poll(g, w)
     poll(g, w)
     assert not gh.argv("gh", "pr", "merge") and [p for _, p in out.posts if "merged by its owner" in p] == [f"{PR} approved on {HEAD[:12]} by reviewer; o/r is merged by its owner"]
     unlisted = dataclasses.replace(GCFG, repos=())  # a repository not in [repos] is the owner's
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "APPROVED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
     g, _ = make(gh, unlisted)
     poll(g, audit_world(unlisted))
     assert not gh.argv("gh", "pr", "merge")
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "APPROVED"), rv("R2", "rev2", "CHANGES_REQUESTED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED"), rv(2, "rev2", "CHANGES_REQUESTED")]}))
     g, _ = make(gh)
     poll(g, audit_world())
     assert not gh.argv("gh", "pr", "merge")
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "COMMENTED"), rv("R2", "copilot", "APPROVED")]}))  # no non-bot approval
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "COMMENTED"), rv(2, "copilot", "APPROVED")]}))  # no non-bot approval
     g, _ = make(gh)
     poll(g, audit_world())
     assert not gh.argv("gh", "pr", "merge")
 
 
 def test_commented_is_a_finding_without_verdict():
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "COMMENTED", body="nit: rename x")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "COMMENTED", body="nit: rename x")]}))
     g, _ = make(gh)
     w = audit_world()
     out = poll(g, w)
@@ -168,7 +199,7 @@ def test_commented_is_a_finding_without_verdict():
 
 
 def test_changes_requested_returns_the_study():
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "CHANGES_REQUESTED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "CHANGES_REQUESTED")]}))
     g, _ = make(gh)
     w = audit_world()
     poll(g, w)
@@ -176,11 +207,11 @@ def test_changes_requested_returns_the_study():
 
 
 def test_one_mirror_line_per_review_never_parsed_back():
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "COMMENTED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "COMMENTED")]}))
     g, _ = make(gh)
     w = audit_world()
     first = poll(g, w)
-    gh.prs[("o/r", "9")]["latestReviews"].append(rv("R2", "rev2", "APPROVED"))
+    gh.prs[("o/r", "9")]["reviews"].append(rv(2, "rev2", "APPROVED"))
     second = poll(g, w)
     third = poll(g, w)
     lines = [t for _, t in first.posts + second.posts + third.posts if t.startswith("SIGN-OFF")]
@@ -198,12 +229,12 @@ def test_driver_mirrors_into_the_thread_and_the_echo_is_not_a_signoff(tmp_path, 
         w = audit_world(cfg)
         store = Store(cfg.state_file)
         store.save(w.state, 0, w.now)
-        gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "COMMENTED", body="looks fine")]}))
+        gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "COMMENTED", body="looks fine")]}))
         g, _ = make(gh, cfg)
         drv = Driver(cfg, Client(cfg.socket_path), store, llm=lambda n, p: LLM[n], clock=lambda: w.now, sleep=lambda s: None, github=g)
         for _ in range(3): drv.run_once()
         posts = [m for m in server.view(w.state.thread)["messages"] if contracts.MIRROR_MARK in m["text"]]
-        assert len(posts) == 1 and posts[0]["text"].endswith(f"ref: {w.state.thread}/github/review-R1")
+        assert len(posts) == 1 and posts[0]["text"].endswith(f"ref: {w.state.thread}/github/review-1")
         s = store.load(w.state.thread)
         assert s.signoffs == {} and s.stage == "Audit" and sum("COMMENTED" in f for f in s.findings) == 1
     finally:
@@ -211,24 +242,211 @@ def test_driver_mirrors_into_the_thread_and_the_echo_is_not_a_signoff(tmp_path, 
 
 
 def test_github_disabled_polls_nothing():
-    gh = FakeGh((PR, {"latestReviews": [rv("R1", "reviewer", "APPROVED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
     g, _ = make(gh, dataclasses.replace(GCFG, github=GitHubCfg()))
     assert g.poll(audit_world().state, 0).events == [] and gh.calls == []
 
 
+# -- round 1 of review: B1-B4, L1-L4 ---------------------------------------------------------
+# chengcli/fridica-research#18, captured 2026-10-04: `gh pr view --json headRefOid,latestReviews,reviewDecision` and one
+# element of `gh api repos/chengcli/fridica-research/pulls/18/reviews`, verbatim.
+REAL_VIEW = {"headRefOid": "21970279e713fccfd32543281ea3209e9ea62c19", "latestReviews": [{"id": "", "author": {"login": "UCzhangxi"}, "authorAssociation": "COLLABORATOR", "body": "...", "submittedAt": "2026-10-04T18:05:17Z", "includesCreatedEdit": False, "reactionGroups": [], "state": "APPROVED", "commit": {"oid": ""}}], "reviewDecision": "APPROVED"}
+REAL_REVIEW = {"author_association": "COLLABORATOR", "body": "...", "commit_id": "21970279e713fccfd32543281ea3209e9ea62c19", "id": 5407449127, "state": "APPROVED", "submitted_at": "2026-10-04T18:05:17Z", "user": {"login": "UCzhangxi", "type": "User"}}
+
+
+def test_b1_reviews_bind_to_the_head_through_rest_commit_id_never_latest_reviews():
+    real_head = REAL_VIEW["headRefOid"]
+    cfg = dataclasses.replace(GCFG, reviewers=(Reviewer(REV, "scope", "UCzhangxi"),), repos=(Repo("o/r", "driver", ("UCzhangxi",)),))
+    for rest, merges in (([REAL_REVIEW], True), ([], False)):  # the same approval, once in REST and once only in latestReviews
+        gh = FakeGh((PR, {"headRefOid": real_head}))
+        real = gh.__call__
+
+        def run(argv, stdin, rest=rest, real=real):
+            if argv[:3] == ["gh", "pr", "view"]:
+                real(argv, stdin)
+                return json.dumps({**REAL_VIEW, "state": "OPEN", "mergedAt": None, "mergeCommit": None, "author": {"login": "implementer"}, "milestone": {"title": "R1"}})
+            if argv[:3] == ["gh", "api", "--paginate"]:
+                real(argv, stdin)
+                return json.dumps(rest)
+            return real(argv, stdin)
+        g, _ = make(run, cfg)
+        w = World(cfg=cfg)
+        w.to_implement()
+        w.finish("implementer", result(artifacts=[PR], machine_state={"branch": "b", "commit": real_head[:7], "dirty": False}))
+        out = poll(g, w)
+        assert gh.argv("gh", "api", "--paginate") == [["gh", "api", "--paginate", "repos/o/r/pulls/9/reviews?per_page=100"]]
+        if merges:
+            assert [e.data for e in out.events] == [{"sender": REV, "pr": PR, "sha": real_head, "verdict": "approve"}] and w.state.audit_scopes["scope"]["verdict"] == "approve"
+            assert gh.argv("gh", "pr", "merge") == [["gh", "pr", "merge", "9", "-R", "o/r", "--squash", "--match-head-commit", real_head]]
+            assert (f"review-{REAL_REVIEW['id']}", f"SIGN-OFF {contracts.MIRROR_MARK} UCzhangxi: APPROVED on o/r#9 at {real_head[:12]}") in out.posts
+        else:
+            assert out.events == [] and not gh.argv("gh", "pr", "merge") and w.state.audit_scopes["scope"]["signed_at"] is None
+        assert all("latestReviews" not in a[a.index("--json") + 1] for a in gh.argv("gh", "pr", "view"))
+
+
+def test_b1_latest_review_per_login_is_the_greatest_submitted_at_then_id():
+    gh = FakeGh((PR, {"reviews": [rv(5, "reviewer", "APPROVED", at="2026-10-04T10:00:00Z"), rv(3, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T11:00:00Z")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    out = poll(g, w)
+    assert [e.data["verdict"] for e in out.events if e.kind == "sign_off"] == ["changes"] and not gh.argv("gh", "pr", "merge")
+    same = "2026-10-04T10:00:00Z"
+    gh = FakeGh((PR, {"reviews": [rv(8, "reviewer", "APPROVED", at=same), rv(7, "reviewer", "CHANGES_REQUESTED", at=same), rv(9, "reviewer", "COMMENTED", at="2026-10-04T12:00:00Z")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    out = poll(g, w)
+    assert [e.data["verdict"] for e in out.events if e.kind == "sign_off"] == ["approve"] and len(gh.argv("gh", "pr", "merge")) == 1  # a later COMMENTED keeps the approval
+
+
+def test_b2_only_configured_reviewers_count_never_an_outsider_or_the_author():
+    gh = FakeGh((PR, {"author": {"login": "rev2"}, "reviews": [rv(1, "stranger", "APPROVED", body="lgtm"), rv(2, "rev2", "APPROVED")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    out = poll(g, w)
+    assert not gh.argv("gh", "pr", "merge") and [e.kind for e in out.events] == ["finding", "finding"] and out.posts == []
+    assert w.state.findings[-2].endswith(f"GitHub review by stranger on o/r#9 at {HEAD[:12]} (APPROVED) not counted: not a configured reviewer of o/r: lgtm")
+    assert f"GitHub review by rev2 on o/r#9 at {HEAD[:12]} (APPROVED) not counted: the PR's author" in w.state.findings[-1]
+    assert w.state.audit_scopes["scope"]["signed_at"] is None and w.state.stage == "Audit"
+    gh.prs[("o/r", "9")]["reviews"].append(rv(3, "reviewer", "APPROVED"))
+    out = poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[-1][1].endswith(f"after approval by reviewer on {HEAD[:12]}")
+
+
+def test_b3_a_delivery_that_raises_is_redelivered_on_the_next_poll():
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "COMMENTED", body="nit")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    calls: list[str] = []
+
+    def deliver(item):
+        calls.append(item.key)
+        if item.events and calls.count(item.key) == 1: raise RuntimeError("store busy")
+        for ev in item.events: w.feed(ev)
+    with pytest.raises(RuntimeError): g.poll(w.state, w.now, deliver)
+    assert not any("COMMENTED" in f for f in w.state.findings)
+    g.poll(w.state, w.now, deliver)
+    g.poll(w.state, w.now, deliver)
+    assert calls == ["post:review-1", "1", "1"] and sum("COMMENTED" in f for f in w.state.findings) == 1  # the post once, the events again
+
+
+def test_b3_driver_redelivers_a_post_or_event_that_failed(tmp_path, sock_dir):
+    sock = os.path.join(sock_dir, "c.sock")
+    server = FakeControl(sock, owner=OWNER).start()
+    try:
+        cfg = dataclasses.replace(GCFG, socket=sock, state_path=str(tmp_path / "s.sqlite3"))
+        w = audit_world(cfg)
+        store = Store(cfg.state_file)
+        store.save(w.state, 0, w.now)
+        gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "COMMENTED", body="looks fine")]}))
+        g, _ = make(gh, cfg)
+        drv = Driver(cfg, Client(cfg.socket_path), store, llm=lambda n, p: LLM[n], clock=lambda: w.now, sleep=lambda s: None, github=g)
+        post, apply, fails = drv.client.post_message, drv.apply, {"post": 1, "apply": 1}
+
+        def flaky_post(*a, **kw):
+            if contracts.MIRROR_MARK in a[1].text and fails["post"]:
+                fails["post"] -= 1
+                raise ControlError(503, "busy")
+            return post(*a, **kw)
+
+        def flaky_apply(thread, ev, cursor=None):
+            if ev.kind == "finding" and "COMMENTED" in ev["text"] and fails["apply"]:
+                fails["apply"] -= 1
+                raise RuntimeError("disk full")
+            return apply(thread, ev, cursor)
+        drv.client.post_message, drv.apply = flaky_post, flaky_apply
+        for _ in range(4): drv.run_once()
+        assert fails == {"post": 0, "apply": 0}
+        assert len([m for m in server.view(w.state.thread)["messages"] if contracts.MIRROR_MARK in m["text"]]) == 1
+        assert sum("COMMENTED" in f for f in store.load(w.state.thread).findings) == 1
+    finally:
+        server.stop()
+
+
+def test_b4_open_pr_resumes_after_a_failed_step_without_a_second_pr():
+    gh = FakeGh()
+    g, meta = make(gh)
+    body = g.next_pr_body("o/r", "s", 21, "T", 2)
+    gh.fail_once(lambda a: a[:4] == ["gh", "api", "-X", "PATCH"])
+    with pytest.raises(RuntimeError): g.open_pr("o/r", "b", "main", "t", body)
+    gh.fail_once(lambda a: "repos/o/r/pulls/13/requested_reviewers" in a)
+    with pytest.raises(RuntimeError, match="incomplete"): g.open_pr("o/r", "b", "main", "t", body)
+    assert g.open_pr("o/r", "b", "main", "t", body) == "https://github.com/o/r/pull/13"
+    assert len(gh.argv("gh", "pr", "create")) == 1 and len(gh.argv("gh", "api", "-X", "PATCH")) == 2
+    assert [d["variables"]["content"] for a, d in gh.calls if d and d.get("query") == board.M_ADD_ITEM] == ["PR_r_13"]
+    assert [d["reviewers"] for a, d in gh.api("repos/o/r/pulls/13/requested_reviewers")] == [["reviewer"], ["rev2"], ["reviewer"]]
+    fresh, _ = make(gh)  # the record lost: the PR of the earlier attempt is found by its head branch
+    assert fresh.open_pr("o/r", "b", "main", "t", body) == "https://github.com/o/r/pull/13" and len(gh.argv("gh", "pr", "create")) == 1
+    gh = FakeGh((PR, {}))  # the PR under audit: a failed milestone is retried without adding the PR to the project again
+    g, _ = make(gh)
+    w = audit_world()
+    gh.fail_once(lambda a: a[:4] == ["gh", "api", "-X", "PATCH"])
+    poll(g, w)
+    poll(g, w)
+    poll(g, w)
+    assert [d["variables"]["content"] for a, d in gh.calls if d and d.get("query") == board.M_ADD_ITEM] == ["PR_r_9"] and len(gh.argv("gh", "api", "-X", "PATCH")) == 2
+
+
+def test_l1_an_approver_without_slack_mapping_is_recorded_while_the_merge_proceeds():
+    gh = FakeGh((PR, {"reviews": [rv(1, "rev2", "APPROVED")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    out = poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[0][1] == f"SIGN-OFF {contracts.MIRROR_MARK} rev2: APPROVED on o/r#9 at {HEAD[:12]}"
+    assert f"GitHub review by rev2 on o/r#9 at {HEAD[:12]} (APPROVED): no Slack id maps to rev2" in w.state.findings[-1]
+
+
+def test_l2_a_merge_whose_follow_up_view_fails_is_still_recorded():
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
+    g, meta = make(gh)
+    w = audit_world()
+    gh.fail_once(lambda a: a[:3] == ["gh", "pr", "view"] and bool(gh.argv("gh", "pr", "merge")))
+    poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and "github:revision:o/r:g1" not in meta
+    out = poll(g, w)
+    assert meta["github:revision:o/r:g1"] == SQUASH and out.posts == [(f"merged-{HEAD[:12]}", f"merged o/r#9 (squash) as {SQUASH} after approval by reviewer on {HEAD[:12]}")]
+    assert poll(g, w).posts == [] and len(gh.argv("gh", "pr", "merge")) == 1
+
+
+def test_l3_study_board_and_milestone_on_one_line():
+    line = "Study: Slack study thread 1759581234.567890, board https://github.com/users/chengcli/projects/8, milestone R2"
+    body = f"Summary.\n\nCloses #21\n{line}\n"
+    assert contracts.pr_hygiene_missing(body) == [] and contracts.pr_milestone(body) == "R2"
+    assert contracts.pr_hygiene_missing(f"Summary.\n\nCloses #21\n{line.replace(', milestone R2', '')}\n") == ["milestone"]
+    g, _ = make(gh := FakeGh())
+    assert g.open_pr("o/r", "b", "main", "t", body) == "https://github.com/o/r/pull/13" and gh.api("repos/o/r/milestones")[0][1] == {"title": "R2"}
+
+
+def test_l4_a_reviewer_github_refuses_is_requested_once_and_recorded():
+    gh = FakeGh((PR, {}))
+    gh.refuse = {"rev2"}
+    g, _ = make(gh)
+    w = audit_world()
+    poll(g, w)
+    poll(g, w)
+    reqs = lambda: [d["reviewers"] for a, d in gh.api("repos/o/r/pulls/9/requested_reviewers")]  # noqa: E731
+    assert reqs() == [["reviewer"], ["rev2"]]
+    assert sum("GitHub refused the review request for rev2 on o/r#9" in f for f in w.state.findings) == 1
+    gh.prs[("o/r", "9")]["headRefOid"] = OLD  # a new head: requested again, a transient failure retried, the refused login not
+    gh.fail_once(lambda a: "repos/o/r/pulls/9/requested_reviewers" in a)
+    poll(g, w)
+    poll(g, w)
+    poll(g, w)
+    assert reqs() == [["reviewer"], ["rev2"], ["reviewer"], ["reviewer"]]
+
+
 # -- R24: late reviews -------------------------------------------------------------------
 def test_post_merge_changes_requested_is_acknowledged_recorded_and_carried():
-    late = rv("R9", "reviewer", "CHANGES_REQUESTED", at="2026-10-04T13:00:00Z", body="- rename foo\n- add a test for bar\n")
-    gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}, "latestReviews": [rv("R1", "rev2", "APPROVED", at="2026-10-04T11:00:00Z")]}))
+    late = rv(9, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T13:00:00Z", body="- rename foo\n- add a test for bar\n")
+    gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}, "reviews": [rv(1, "rev2", "APPROVED", at="2026-10-04T11:00:00Z")]}))
     g, meta = make(gh)
     w = audit_world()
     w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")  # the study delivered on the Slack fallback
     assert w.state.stage == "Delivered"
     poll(g, w)
-    gh.prs[("o/r", "9")]["latestReviews"].append(late)
+    gh.prs[("o/r", "9")]["reviews"].append(late)
     out = poll(g, w)
     assert gh.api("repos/o/r/issues/9/comments") == [(["gh", "api", "-X", "POST", "repos/o/r/issues/9/comments", "--input", "-"], {"body": "@reviewer acknowledged, goes into the next PR."})]
-    assert ("ack-R9", "acknowledged, goes into the next PR: post-merge review by reviewer on o/r#9") in out.posts
+    assert ("ack-9", "acknowledged, goes into the next PR: post-merge review by reviewer on o/r#9") in out.posts
     assert any(t.endswith("(after merge)") for _, t in out.posts)
     assert w.state.findings[-2:] == ["iteration 1 note during Delivered: post-merge review by reviewer on o/r#9: rename foo", "iteration 1 note during Delivered: post-merge review by reviewer on o/r#9: add a test for bar"]
     assert w.state.stage == "Delivered" and not gh.argv("gh", "pr", "merge")
@@ -259,7 +477,7 @@ def test_two_prs_12_in_two_repos():
     w = audit_world(pr=a)
     w.ev("sign_off", sender=REV, pr=b, sha=SHA, verdict="approve")
     assert w.state.stage == "Audit" and "sign-off from UREV ignored" in w.state.findings[-1]
-    gh = FakeGh((a, {}), (b, {"latestReviews": [rv("R1", "reviewer", "APPROVED")]}))
+    gh = FakeGh((a, {}), (b, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
     g, meta = make(gh, dataclasses.replace(GCFG, repos=(Repo("a/x", "driver"), Repo("b/y", "driver"))))
     out = poll(g, w)
     assert out.events == [] and w.state.stage == "Audit" and not gh.argv("gh", "pr", "merge")  # b/y#12's approval is not a/x#12's

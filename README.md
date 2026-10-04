@@ -65,7 +65,7 @@ U0AAAAAAA = "alice"
 enabled = true
 poll_interval = "2m"
 
-[repos]                             # merge = "driver": the driver squash-merges after a non-bot approval on the head
+[repos]                             # merge = "driver": the driver squash-merges after an approval by a listed reviewer on the head
 "chengcli/fridica-research" = {merge = "driver", reviewers = ["alice", "bob"]}
 "chengcli/fridica" = {merge = "owner"}
 ```
