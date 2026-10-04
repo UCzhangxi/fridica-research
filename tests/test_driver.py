@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import tempfile
 
 import pytest
 
@@ -21,9 +20,8 @@ class Clock:
 
 
 @pytest.fixture
-def world(tmp_path):
-    d = tempfile.mkdtemp(prefix="fr-")  # short path: Unix sockets are limited to ~100 bytes
-    sock = os.path.join(d, "c.sock")
+def world(tmp_path, sock_dir):
+    sock = os.path.join(sock_dir, "c.sock")
     server = FakeControl(sock, owner=OWNER).start()
     cfg = dataclasses.replace(CFG, socket=sock, state_path=str(tmp_path / "state.sqlite3"))
     yield server, cfg

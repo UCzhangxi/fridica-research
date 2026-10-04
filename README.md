@@ -22,7 +22,7 @@ fridica-research --help
 `~/.config/fridica-research/research.toml`:
 
 ```toml
-channels = ["C0C2D3PCW20"]          # research channels; a root post here starts a study
+channels = ["C0123456789"]          # research channels; a root post here starts a study
 starters = []                       # Slack user ids allowed to start studies (empty: the owner)
 max_iterations = 3
 max_debate_rounds = 2
@@ -64,7 +64,7 @@ U0AAAAAAA = "alice"
 
 ```sh
 fridica-research serve                       # the driver, one per owner, on the daemon's machine
-fridica-research start C0C2D3PCW20 "Study X" --projected-hours 3 [--issue 12]
+fridica-research start C0123456789 "Study X" --projected-hours 3 [--issue 12]
 fridica-research list [--board]
 fridica-research stop <workspace:channel:root_ts>
 fridica-research resume <thread>             # after a Blocked study is fixed

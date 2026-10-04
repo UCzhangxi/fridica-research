@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import tempfile
 
 import pytest
 
@@ -19,9 +18,8 @@ CLAIM_ALPHA = "Claim (iteration 1): Alpha design\napproach: alpha\nwhy: w\nalso 
 
 
 @pytest.fixture
-def world(tmp_path):
-    d = tempfile.mkdtemp(prefix="fr-")
-    sock = os.path.join(d, "c.sock")
+def world(tmp_path, sock_dir):
+    sock = os.path.join(sock_dir, "c.sock")
     server = FakeControl(sock, owner=OWNER).start()
     cfg = dataclasses.replace(CFG, socket=sock, state_path=str(tmp_path / "state.sqlite3"), settle_window=0)
     yield server, cfg

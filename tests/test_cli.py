@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 
 from fridica_research import cli, contracts
 from fridica_research.store import Store
@@ -24,10 +23,9 @@ def test_help_and_subcommands():
     assert p.parse_args(["serve", "--once"]).once
 
 
-def test_start_posts_root_and_list_stop_resume(tmp_path, capsys, monkeypatch):
+def test_start_posts_root_and_list_stop_resume(tmp_path, sock_dir, capsys, monkeypatch):
     monkeypatch.setattr(cli, "claude_runner", lambda model: (lambda name, prompt: {"brief": "b", "questions": []}))
-    d = tempfile.mkdtemp(prefix="fr-")
-    sock = os.path.join(d, "c.sock")
+    sock = os.path.join(sock_dir, "c.sock")
     server = FakeControl(sock, owner=OWNER).start()
     try:
         cfgp = write_config(tmp_path, sock)

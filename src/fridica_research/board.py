@@ -212,10 +212,11 @@ def role_totals(state: State) -> dict[str, dict[str, float]]:
         if row["stage"] != "Audit":
             add(row.get("role", "driver"), row["projected"], row["actual"])
             continue
-        for sc in state.audit_scopes.values():
+        scopes = Board.scopes_of(state, row)  # each Audit row pairs with its own iteration's scopes and sign-off times
+        for sc in scopes.values():
             if sc["reviewer"]: add("peer-reviewer", row["projected"], (sc["signed_at"] - row["start"]) if sc["signed_at"] else None)
             else: add("auditor", row["projected"], row["actual"])
-        if not state.audit_scopes: add("auditor", row["projected"], row["actual"])
+        if not scopes: add("auditor", row["projected"], row["actual"])
     return {k: {m: round(v, 2) for m, v in r.items()} for k, r in out.items()}
 
 
@@ -247,9 +248,22 @@ class Board:
         finally:
             self.remember(key, json.dumps(cards))
 
-    def open_card(self, title: str, body: str, assignee: str, role: str, stage: str, start: float, projected: float, state: State) -> int:
-        """A plain issue with exactly one assignee (or none, never the owner on a peer's card), In Progress from creation."""
-        number = self.api.create_issue(title, body, assignee)
+    def open_card(self, cards: list, scope: str | None, title: str, body: str, assignee: str, role: str, stage: str, start: float, projected: float, state: State) -> dict:
+        """A plain issue with exactly one assignee (or none, never the owner on a peer's card), In Progress from creation.
+
+        The issue number is recorded in `cards` right after `gh issue create`, before any field write: a transient
+        gh failure then makes the next sync finish the writes (`filled`) instead of opening a second issue."""
+        card = next((c for c in cards if c["scope"] == scope), None)
+        if card is None:
+            card = {"issue": self.api.create_issue(title, body, assignee), "closed": False, "scope": scope, "assignee": assignee, "filled": False}
+            cards.append(card)
+        if not card.get("filled", True):
+            self.fill_card(card["issue"], role, stage, start, projected, state)
+            card["filled"] = True
+        return card
+
+    def fill_card(self, number: int, role: str, stage: str, start: float, projected: float, state: State):
+        """The project item and its creation-time fields; every write is idempotent, so a retry repeats them all."""
         self.api.add_to_project(number)
         self.api.set_option(number, "Stage", stage)
         self.api.set_option(number, "Role", role)
@@ -259,7 +273,6 @@ class Board:
         self.api.set_number(number, "Iteration", state.iteration)
         self.api.set_number(number, "Generation", state.generation)
         self.api.set_text(number, "Thread", state.thread)
-        return number
 
     def close(self, number: int, finished: str | None, actual_hours: float):
         self.api.set_dates(number, finished=finished)
@@ -272,51 +285,44 @@ class Board:
         body = stage_table(state)
         if "issue" not in cards:
             given = self.issue_numbers.get(state.thread) or self.issue_numbers.get(state.channel)
-            if given:
-                number = int(given)
-                self.api.edit_issue(number, "--body", body, *(["--add-assignee", owner_login] if owner_login else []))
-                self.api.add_to_project(number)
-                self.api.set_option(number, "Role", "driver")
-                self.api.set_status(number, "in_progress")
-                self.api.set_dates(number, started=day(state.started_at), projected_finish=day(state.started_at + state.projected_hours * 3600))
-                self.api.set_number(number, "Projected hours", state.projected_hours)
-                self.api.set_number(number, "Generation", state.generation)
-                self.api.set_text(number, "Thread", state.thread)
-            else: number = self.open_card(self.title(state), body, owner_login, "driver", "Explore", state.started_at, state.projected_hours * 3600, state)
-            cards["issue"] = number
-            if owner_login: self.api.set_text(number, "Owner", owner_login)
-        else: self.api.edit_issue(cards["issue"], "--body", body)
+            cards["issue"], cards["given"], cards["filled"] = (int(given) if given else self.api.create_issue(self.title(state), body, owner_login)), bool(given), False
         n = cards["issue"]
+        if not cards.get("filled", True):  # creation-time writes, finished on a later sync if gh failed midway
+            if cards.get("given") and owner_login: self.api.edit_issue(n, "--add-assignee", owner_login)
+            self.fill_card(n, "driver", "Explore", state.started_at, state.projected_hours * 3600, state)
+            if owner_login: self.api.set_text(n, "Owner", owner_login)
+            cards["filled"] = True
+        self.api.edit_issue(n, "--body", body)
         self.api.set_option(n, "Stage", BOARD_STAGE.get(state.stage, state.stage))
         self.api.set_number(n, "Iteration", state.iteration)
         for field, value in (("Approach", (state.claim or {}).get("slug")), ("Workers", _workers(state)), ("Result", state.notes[-1] if state.stage in ("Stopped", "Blocked") and state.notes else state.deliverable.get("summary", "")[:500]), ("Follow-on", state.followon), ("Peer reviewers", ", ".join(filter(None, (self.login(r.handle, state) for r in self.cfg.reviewers))))):
             if value: self.api.set_text(n, field, value)
 
-    def audit_cards(self, state: State, row: dict, cards: dict) -> list[dict]:
+    def audit_cards(self, state: State, row: dict, cards: dict, out: list):
         """R13: one card per audit scope; peers' cards go to the peer (never to the owner), the local auditor's to the owner."""
-        out = []
-        for scope, sc in state.audit_scopes.items():
+        iteration = row.get("iteration", state.iteration)
+        for scope, sc in self.scopes_of(state, row).items():
             if sc["reviewer"]:
-                login = self.login(sc["reviewer"], state)
-                number = self.open_card(f"Audit {scope} (iteration {state.iteration}): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nAudit scope: {scope}. Reply `SIGN-OFF <pr> <sha> approve|changes` in the study thread.", login, "peer-reviewer", "Audit", row["start"], row["projected"], state)
-                out.append({"issue": number, "closed": False, "scope": scope, "assignee": login})
+                self.open_card(out, scope, f"Audit {scope} (iteration {iteration}): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nAudit scope: {scope}. Reply `SIGN-OFF <pr> <sha> approve|changes` in the study thread.", self.login(sc["reviewer"], state), "peer-reviewer", "Audit", row["start"], row["projected"], state)
             else:
-                number = self.open_card(f"Audit {scope} (iteration {state.iteration}, local auditor): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nAudit scope: {scope}, by the owner's auditor worker.", self.login(self.cfg.owner, state), "auditor", "Audit", row["start"], row["projected"], state)
-                out.append({"issue": number, "closed": False, "scope": scope, "assignee": self.login(self.cfg.owner, state)})
-        return out
+                self.open_card(out, scope, f"Audit {scope} (iteration {iteration}, local auditor): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nAudit scope: {scope}, by the owner's auditor worker.", self.login(self.cfg.owner, state), "auditor", "Audit", row["start"], row["projected"], state)
+
+    @staticmethod
+    def scopes_of(state: State, row: dict) -> dict:
+        """The audit scopes of one Audit row: the row's own copy (mirrored by the machine), else the study's current scopes for the latest row."""
+        if "scopes" in row: return row["scopes"]
+        return state.audit_scopes if row is next((r for r in reversed(state.stage_log) if r["stage"] == "Audit"), None) else {}
 
     def sync_stages(self, state: State, cards: dict):
         owner_login = self.login(self.cfg.owner, state)
         stages = cards.setdefault("stages", [])
         for i, row in enumerate(state.stage_log):
-            if i >= len(stages):
-                if row["stage"] == "Audit": stages.append({"cards": self.audit_cards(state, row, cards)})
-                else:
-                    number = self.open_card(f"{row['stage']} (iteration {state.iteration}): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nStage run {i + 1} of {state.thread}.", owner_login, row.get("role", "driver"), row["stage"], row["start"], row["projected"], state)
-                    stages.append({"cards": [{"issue": number, "closed": False, "scope": None, "assignee": owner_login}]})
+            if i >= len(stages): stages.append({"cards": []})
+            if row["stage"] == "Audit": self.audit_cards(state, row, cards, stages[i]["cards"])
+            else: self.open_card(stages[i]["cards"], None, f"{row['stage']} (iteration {row.get('iteration', state.iteration)}): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nStage run {i + 1} of {state.thread}.", owner_login, row.get("role", "driver"), row["stage"], row["start"], row["projected"], state)
             for card in stages[i]["cards"]:
-                if card["closed"]: continue
-                sc = state.audit_scopes.get(card["scope"]) if card["scope"] else None
+                if card["closed"] or not card.get("filled", True): continue
+                sc = self.scopes_of(state, row).get(card["scope"]) if card["scope"] else None
                 if sc and sc["reviewer"]:
                     if not card["assignee"] and self.login(sc["reviewer"], state):
                         card["assignee"] = self.login(sc["reviewer"], state)

@@ -9,7 +9,7 @@ import pytest
 from fridica_research import board
 from fridica_research.board import Board, Projects
 from fridica_research.config import Board as BoardCfg
-from support import CFG, World
+from support import CFG, EXPLORER_REPORT, PR, SHA, World, report, result
 
 BCFG = dataclasses.replace(CFG, board=BoardCfg(enabled=True, owner="chengcli", number=8, repo="chengcli/fridica-research"))
 PROJECT = {"id": "PVT_1", "fields": {"nodes": [
@@ -28,11 +28,15 @@ class FakeGh:
         self.issues = 0
         self.missing = set(fields_missing)
         self.fail_on = fail_on
+        self.fail_once: str | None = None  # fails the first matching call, then clears
 
     def __call__(self, argv: list[str], stdin: str | None) -> str:
         doc = json.loads(stdin) if stdin else None
         self.calls.append((argv, doc))
         if self.fail_on and self.fail_on in " ".join(argv) + (doc or {}).get("query", ""): raise RuntimeError("gh failed")
+        if self.fail_once and self.fail_once in " ".join(argv) + (doc or {}).get("query", ""):
+            self.fail_once = None
+            raise RuntimeError("gh failed once")
         if argv[:3] == ["gh", "api", "graphql"]:
             return json.dumps({"data": self.answer(doc["query"], doc["variables"])})
         if argv[:3] == ["gh", "issue", "create"]:
@@ -160,7 +164,7 @@ def test_study_and_stage_cards_are_plain_issues_with_one_assignee():
     assert any(v["field"] == "F_Peer_reviewers" and v["v"] == "reviewer" for v in gh.sets(board.M_SET_TEXT))
     # The reviewer signs off after delivery: their card closes with Finished = sign-off day and Status Done.
     w.now += 7200
-    w.ev("sign_off", sender="UREV", pr="p", sha="s", verdict="approve")
+    w.ev("sign_off", sender="UREV", pr=PR, sha=SHA, verdict="approve")
     b.sync(w.state)
     assert [a[3] for a in gh.argv("gh", "issue", "close")][-1] == "6" and [c for c in flat(cards_of(meta, w)) if c["issue"] == 6][0]["closed"]
     assert [v for v in gh.sets(board.M_SET_NUMBER) if v["item"] == "PVTI_I_6" and v["field"] == "F_Actual_hours"][0]["v"] == 2.0
@@ -184,7 +188,7 @@ def test_role_totals():
     w = World()
     w.to_delivered()
     w.now += 1800
-    w.ev("sign_off", sender="UREV", pr="p", sha="s", verdict="approve")
+    w.ev("sign_off", sender="UREV", pr=PR, sha=SHA, verdict="approve")
     totals = board.role_totals(w.state)
     assert set(totals) == {"explorer", "driver", "debater", "implementer", "auditor", "peer-reviewer"}
     assert totals["explorer"]["projected"] == 0.33 and totals["driver"]["projected"] == round((120 + 600) / 3600, 2)
@@ -209,7 +213,7 @@ def test_board_failure_is_logged_and_retried_next_transition(caplog):
     b.sync(w.state)  # the study card is created, the stage card's `gh issue create` fails
     assert "board update failed" in caplog.text
     cards = json.loads(meta[f"board:{w.state.thread}"])
-    assert cards["issue"] == 1 and cards["stages"] == []
+    assert cards["issue"] == 1 and flat(cards) == []
     gh.fail_on = None
     b.sync(w.state)
     assert [c["issue"] for c in flat(json.loads(meta[f"board:{w.state.thread}"]))] == [2]
@@ -241,3 +245,67 @@ def test_projects_organization_owner_uses_organization_query():
         calls.append(json.loads(stdin))
         return json.dumps({"data": {"organization": {"projectV2": {"id": "PVT_o", "fields": {"nodes": []}}}}})
     assert Projects(cfg, gh).discover("org", 1).id == "PVT_o" and calls[0]["query"].startswith("query($owner:String!,$number:Int!){organization(login:$owner)")
+
+
+def test_issue_number_is_saved_before_field_writes_so_a_retry_never_duplicates():
+    """F1: `gh issue create` succeeded, the next write failed: the retry finishes the writes on the same issue."""
+    w = World(cfg=BCFG)
+    gh = FakeGh()
+    b, gh, meta = make(gh)
+    w.start()
+    gh.fail_once = board.M_ADD_ITEM  # the study card's addProjectV2ItemById fails right after its creation
+    b.sync(w.state)
+    cards = cards_of(meta, w)
+    assert cards["issue"] == 1 and cards["filled"] is False and cards["stages"] == [] and len(gh.argv("gh", "issue", "create")) == 1
+    b.sync(w.state)
+    cards = cards_of(meta, w)
+    assert cards["filled"] is True and [c["issue"] for c in flat(cards)] == [2] and len(gh.argv("gh", "issue", "create")) == 2
+    assert [v["content"] for v in gh.sets(board.M_ADD_ITEM)] == ["I_1", "I_1", "I_2"]  # the failed add, its retry, then #2
+    w.to_claim()
+    gh.fail_once = board.M_ADD_ITEM  # now the Claim stage card
+    b.sync(w.state)
+    assert [(c["issue"], c["filled"]) for c in flat(cards_of(meta, w))] == [(2, True), (3, False)]
+    b.sync(w.state)
+    assert [(c["issue"], c["filled"]) for c in flat(cards_of(meta, w))] == [(2, True), (3, True)] and len(gh.argv("gh", "issue", "create")) == 3
+    assert [v["content"] for v in gh.sets(board.M_ADD_ITEM)].count("I_3") == 2  # the failed add and its retry, no second issue
+    assert [v["v"] for v in gh.sets(board.M_SET_OPTION) if v["item"] == "PVTI_I_3" and v["field"] == "F_role"] == ["R_driver"]
+
+
+def test_role_totals_pair_each_audit_row_with_its_own_iteration():
+    """Z2: two iterations, a peer sign-off in each; peer time is the sum of the two latencies, not every row x every sign-off."""
+    w = World()
+    w.to_audit()
+    w.now += 1800
+    w.ev("sign_off", sender="UREV", pr=PR, sha=SHA, verdict="approve")
+    w.finish("auditor", result(report=report(verdict="return")))
+    assert w.state.iteration == 2
+    w.finish("explorer", result(report=EXPLORER_REPORT))
+    w.tick(CFG.settle_window)
+    w.finish("mathematician", result(report=report(position="agree")))
+    w.finish("physicist", result(report=report(position="agree")))
+    w.finish("implementer", result(artifacts=[PR], machine_state={"branch": "b", "commit": "def5678", "dirty": False}))
+    w.now += 3600
+    w.ev("sign_off", sender="UREV", pr=PR, sha="def5678", verdict="approve")
+    w.finish("auditor", result(report=report(verdict="pass")))
+    assert w.state.stage == "Delivered"
+    audits = [r for r in w.state.stage_log if r["stage"] == "Audit"]
+    assert [r["iteration"] for r in audits] == [1, 2] and [r["scopes"]["scope"]["signed_at"] - r["start"] for r in audits] == [1800, 3600]
+    totals = board.role_totals(w.state)
+    assert totals["peer-reviewer"] == {"projected": 3.0, "actual": 1.5} and totals["auditor"]["projected"] == 3.0
+
+
+def test_old_iteration_peer_card_does_not_close_on_a_new_iteration_signoff():
+    """The board pairs each Audit row's cards with that row's scopes, not the study's current ones."""
+    w = World(cfg=BCFG)
+    b, gh, meta = make()
+    w.to_audit()
+    w.finish("auditor", result(report=report(verdict="return")))  # iteration 1 ends with the peer's scope unsigned
+    w.finish("explorer", result(report=EXPLORER_REPORT))
+    w.tick(CFG.settle_window)
+    w.finish("mathematician", result(report=report(position="agree")))
+    w.finish("physicist", result(report=report(position="agree")))
+    w.finish("implementer", result(artifacts=[PR], machine_state={"branch": "b", "commit": "def5678", "dirty": False}))
+    w.ev("sign_off", sender="UREV", pr=PR, sha="def5678", verdict="approve")
+    b.sync(w.state)
+    peer_cards = [c for c in flat(cards_of(meta, w)) if c["scope"] == "scope"]
+    assert [(c["issue"], c["closed"]) for c in peer_cards] == [(6, False), (12, True)]  # #8-#11 are iteration 2's Explore..Implement

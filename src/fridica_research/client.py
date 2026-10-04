@@ -12,7 +12,6 @@ import os
 import re
 import socket
 import stat
-import time
 from pathlib import Path
 
 from . import contracts
@@ -89,13 +88,3 @@ class Client:
     def post_root(self, channel: str, req: contracts.PostRequest) -> dict: return self.post(contracts.STUDY_ROOT_ROUTE.format(channel=channel), req.body())
     def stop_worker(self, thread: str, worker_id: str) -> dict: return self.post(contracts.stop_route(thread, worker_id), {"actor": "owner"})
     def set_driver(self, thread: str, driver: str) -> dict: return self.post(contracts.driver_route(thread), {"driver": driver})
-
-    def follow(self, after: int, limit: int = 1000, idle_sleep: float = 2.0, sleep=time.sleep):
-        """Cursor polling: a page with `scanned < limit` reached the ledger's end; sleep then. Yields (event, next)."""
-        while True:
-            page = self.events(after, limit)
-            for e in page.get("events", []): yield e, page["next"]
-            after = page["next"]
-            if page.get("scanned", 0) < limit:
-                yield None, after
-                sleep(idle_sleep)

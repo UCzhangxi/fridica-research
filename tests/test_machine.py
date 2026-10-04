@@ -7,7 +7,7 @@ import pytest
 
 from fridica_research import machine
 from fridica_research.machine import Event
-from support import CFG, EXPLORER_REPORT, PEER, THREAD, World, report, result
+from support import CFG, EXPLORER_REPORT, PEER, PR, SHA, THREAD, World, report, result
 
 
 def test_explore_started_calls_study_brief_then_delegates_explorer():
@@ -348,7 +348,85 @@ def test_audit_scopes_without_local_auditor_and_peer_changes():
     w.to_audit()
     assert [a["role"] for a in w.kinds("delegate")] == ["explorer", "mathematician", "physicist", "mathematician", "physicist", "implementer"]
     assert w.state.phase == "signoff" and w.state.audit_scopes == {"scope": {"reviewer": "UREV", "verdict": None, "signed_at": None}}
-    w.ev("sign_off", sender="USOMEONE", pr="p", sha="s", verdict="approve")  # not a reviewer: recorded, no effect
+    w.ev("sign_off", sender="USOMEONE", pr=PR, sha=SHA, verdict="approve")  # not a reviewer: recorded, no effect
     assert w.state.stage == "Audit"
-    w.ev("sign_off", sender="UREV", pr="p", sha="s", verdict="changes")
+    w.ev("sign_off", sender="UREV", pr=PR, sha=SHA, verdict="changes")
     assert w.state.iteration == 2 and w.state.audit["verdict"] == "return" and "scope=changes" in w.state.findings[0]
+
+
+def test_signoff_for_another_head_is_ignored_and_noted():
+    """F2: a sign-off counts only for the reviewed PR and sha; another head never closes a peer's scope."""
+    cfg = dataclasses.replace(CFG, audit_scopes=("scope",), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    w.ev("sign_off", sender="UREV", pr=PR, sha="0000000", verdict="approve")
+    w.ev("sign_off", sender="UREV", pr="https://github.com/o/r/pull/10", sha=SHA, verdict="approve")
+    assert w.state.stage == "Audit" and w.state.signoffs == {} and w.state.audit_scopes["scope"]["signed_at"] is None
+    assert len(w.state.findings) == 2 and "sign-off from UREV ignored" in w.state.findings[0] and "pull/10" in w.state.findings[1]
+    w.ev("sign_off", sender="UREV", pr="9", sha="abc12", verdict="approve")  # a bare number and a sha prefix name the same head
+    assert w.state.stage == "Delivered" and w.state.signoffs == {"UREV": "approve"}
+
+
+def test_head_matches_table():
+    assert machine.head_matches("https://github.com/o/r/pull/9", "abc1234", PR, SHA) and machine.head_matches("#9", "ABC1234", PR, SHA)
+    assert not machine.head_matches(PR, "abc1235", PR, SHA) and not machine.head_matches("9", "", PR, SHA) and not machine.head_matches("8", SHA, PR, SHA)
+    assert machine.head_matches("anything", "fff", "", "")  # no reviewed head known: nothing to mismatch
+
+
+def test_won_slug_is_not_treated_as_taken_later():
+    """F3: a peer's later claim on our slug loses; the slug must not be excluded from our next pick."""
+    w = World()
+    w.to_claim()  # settling on alpha, own ts .000101
+    w.ev("peer_post", ts="1700000000.999999", sender=PEER, kind="study_claim", text="Claim (iteration 1): x\napproach: alpha\nwhy: w\nalso considered: none")
+    assert w.state.claim["slug"] == "alpha" and "alpha" not in w.state.peer_claims
+    w.tick(CFG.settle_window)
+    w.finish("mathematician", result(report=report(position="agree")))
+    w.finish("physicist", result(report=report(position="agree")))
+    w.finish("implementer")
+    w.finish("auditor", result(report=report(verdict="return")))
+    assert w.state.iteration == 2 and w.state.stage == "Explore"
+    w.finish("explorer", result(report=EXPLORER_REPORT))
+    assert w.state.claim["slug"] == "alpha" and w.state.excluded == []
+
+
+def test_peer_claim_recorded_while_pending_is_dropped_when_our_echo_is_earlier():
+    w = World(auto_post=False)
+    w.to_claim()
+    w.ev("peer_post", ts="1700000000.000900", sender=PEER, kind="study_claim", text="Claim (iteration 1): x\napproach: alpha\nwhy: w\nalso considered: none")
+    assert "alpha" in w.state.peer_claims  # our ts is unknown yet
+    w.ev("own_post_seen", ts="1700000000.000500", kind="study_claim", text=w.kinds("post")[0]["text"])
+    assert w.state.claim["status"] == "settling" and "alpha" not in w.state.peer_claims and w.state.excluded == []
+
+
+def test_post_refused_three_posts_then_rule_r():
+    """F4: a rate-limited post is sent three times in all before the stage fails (rule R)."""
+    w = World(hold=("study_result",))
+    w.to_delivered()
+    n_llm = len(w.kinds("llm_call"))
+    for i in range(3):
+        assert w.state.post_tries == i + 1 and w.state.attempt == 1
+        w.ev("post_refused", post_kind="study_result", code="rate_limited", outcome="failed", retry_after=30)
+        if i < 2: w.tick(30)
+    assert len([p for p in w.kinds("post") if p["post_kind"] == "study_result" and "/a1/" in p.id]) == 3
+    assert len(w.kinds("llm_call")) == n_llm + 1 and w.state.attempt == 2 and w.state.stage == "Deliver" and w.kinds("llm_call")[-1]["name"] == "study_deliver"  # rule R re-runs the deliver call
+
+
+def test_same_reviewer_in_two_scopes_keeps_two_scopes():
+    """F5: one audit scope per reviewer line; one SIGN-OFF from that reviewer signs all of their scopes."""
+    from fridica_research.config import Reviewer
+    cfg = dataclasses.replace(CFG, reviewers=(Reviewer("UREV", "scope"), Reviewer("UREV", "code"), Reviewer("UX", ""), Reviewer("UX", "")), audit_scopes=("scope", "code"), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    assert sorted(w.state.audit_scopes) == ["code", "review-UX", "review-UX-2", "scope"] and w.state.phase == "signoff"
+    w.ev("sign_off", sender="UREV", pr=PR, sha=SHA, verdict="approve")
+    assert [s for s, sc in w.state.audit_scopes.items() if sc["signed_at"]] == ["scope", "code"] and w.state.stage == "Audit"
+
+
+def test_audit_completes_at_once_when_all_scopes_are_peers_and_signoffs_optional():
+    """Z3: no local auditor and `require_signoffs = false`: nothing to wait for, Audit completes immediately."""
+    cfg = dataclasses.replace(CFG, audit_scopes=("scope",), require_signoffs=False)
+    w = World(cfg=cfg)
+    w.to_audit()
+    assert "auditor" not in [a["role"] for a in w.kinds("delegate")]
+    assert w.state.stage == "Delivered" and w.state.audit["verdict"] == "pass" and w.state.audit_scopes["scope"]["signed_at"] is None
+    assert [r["stage"] for r in w.state.stage_log] == ["Explore", "Claim", "Debate", "Implement", "Audit", "Deliver"]

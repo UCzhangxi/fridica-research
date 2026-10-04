@@ -45,6 +45,8 @@ echo is the only way to learn the Slack `ts`), then **settling** for `settle_win
 60 s), then **owned**. Smallest Slack `ts` per slug owns it; a peer claim with an earlier `ts`
 seen while pending or settling makes the driver re-pick from the explorer's approaches minus the
 slugs it lost and the slugs peers hold; no candidates left blocks the study with a notice. A peer
+claim with a later `ts` on the driver's own slug lost and is not recorded as held: the slug stays
+available to this driver in later picks (next iteration). A peer
 claim with an earlier `ts` that arrives after Debate started does not regress the stage: the study
 is marked contested and the owner is told once. Progress notes (`kind=progress`) and human
 replies are never parsed as claims; only `study_claim` metadata from another owner counts.
@@ -56,7 +58,10 @@ Opt-in through `[board] enabled, owner, number, repo, token_env` in `research.to
 is a real issue in `repo` (`gh issue create`, or the issue given to `start --issue N`), added to
 the project with `addProjectV2ItemById`; each stage run (Explore, Claim, Debate, Implement,
 Audit per scope, Deliver, per iteration) is its own plain issue (R13), created when the stage
-starts and added as its own project item, closed when the stage ends. Fields, as on project 8:
+starts and added as its own project item, closed when the stage ends. The issue number is
+recorded in the store right after `gh issue create`, before the project item and its fields are
+written, so a gh failure midway makes the next sync finish the writes on that issue rather than
+open a second one. Fields:
 Stage (single select: Explore, Claim, Debate, Implement, Audit, Deliver, Delivered, Stopped),
 Role (single select, R12), Status (built in, R14), Iteration, Generation, Projected hours,
 Actual hours (number), Started, Projected finish, Finished (date), Owner, Approach, Workers,
@@ -104,10 +109,16 @@ Entering Audit posts the PR link and exact head SHA (from the implementer's `mac
 artifacts), @-mentions the `[audit] reviewers` with their scope, states the sign-off line format,
 and delegates the auditor worker (ephemeral, `auditor_backend`, default `other`) only for the
 scopes no peer takes (R13). Human replies containing `SIGN-OFF <pr> <sha> approve|changes` from
-a configured reviewer are recorded on that reviewer's scope. With `require_signoffs = true`
+a configured reviewer are recorded on every scope that reviewer takes, and only when the line
+names the reviewed head: the PR of the audit request (as a URL, `#N` or `N`) and a prefix of its
+sha (`machine.head_matches`; with no PR or sha known there is nothing to check). A sign-off for another PR or sha is ignored and noted as a finding
+(`sign-off from <user> ignored: ... is not the reviewed head ...`), so a sign-off on a different
+head never closes a peer's card. With `require_signoffs = true`
 (default) the stage waits (after the local auditor's `pass`, if any) until every peer scope is
 signed off; `changes` sends the study to the next iteration; the stage timer or the 2x overrun
-ends the wait and delivers with the missing sign-offs listed. The auditor's verdict comes from the `## Stance` block
+ends the wait and delivers with the missing sign-offs listed. With `require_signoffs = false`
+the stage ends as soon as the local auditor passes, or at once when every scope is a peer's (no
+auditor worker; nothing to wait for); late sign-offs still close the peers' cards. The auditor's verdict comes from the `## Stance` block
 (`verdict: pass|return|reject`); missing counts as `return`; `reject` posts an out-of-scope notice
 and stops the study. The driver never merges.
 
@@ -120,8 +131,8 @@ the card sequence (#1 parent, #2-#7 stages).
 
 ## R8. Assignees and reviewers
 
-Every card is assigned to the owner's GitHub login; the parent card's `Peer reviewers` lists the
-reviewers' logins. `[people]` maps Slack user ids to logins; when a reviewer's login is unknown
+Every card has exactly one assignee (R13): the owner's GitHub login, except a peer's audit card,
+which is assigned to that peer. The parent card's `Peer reviewers` lists the reviewers' logins. `[people]` maps Slack user ids to logins; when a reviewer's login is unknown
 the audit request asks `@user please reply with your GitHub login` and a bare `@login` /
 `github: login` reply from that user is recorded in the study state.
 
@@ -163,7 +174,11 @@ card gets its one assignee once the reply is recorded.
 
 The audit stage is one card per audit scope. `[audit] reviewers` entries carry the Slack id,
 the GitHub login and the scope they take (`{slack, login, scope}`); `[audit] scopes` lists all
-scopes (default: the reviewers' scopes). The driver runs a local auditor worker only for the
+scopes (default: the reviewers' scopes). Each reviewer line is one scope (a line without a scope
+gets `review-<slack id>`, a second such line `review-<slack id>-2`), so the same reviewer on two
+lines keeps two cards; one SIGN-OFF from them signs both. The machine copies the scopes onto the
+iteration's Audit row of the stage log (`scopes`), so each iteration's cards and the per-role
+hours pair with their own sign-offs. The driver runs a local auditor worker only for the
 scopes no peer takes (`Config.uncovered_scopes`; with no reviewers at all, one local audit);
 with every scope taken no auditor worker is delegated. A peer's card closes (Finished = sign-off
 day, Actual hours = sign-off latency, Status Done) when that reviewer's
@@ -188,7 +203,7 @@ no card before its stage starts, so it never writes it.
 | `delegate` refused for slot pressure (`too_many_workers`) | wait for the next job to finish or be interrupted, re-send the same body; bounded by the stage timer |
 | any other 4xx on `delegate` | rule R at once (the same body cannot succeed) |
 | post rejected by the egress gate | `study_result`: re-post a redacted version (details withheld) and notify the owner; anything else or a second rejection: rule R |
-| post rate-limited/failed | re-post after `retry_after` (default 30 s), up to three tries; never an LLM re-run |
+| post rate-limited/failed | re-post the same text after `retry_after` (default 30 s), three posts in all with no LLM re-run; the third refusal is rule R (which for Deliver re-runs the `study_deliver` call) |
 | thread paused/closed/archived | Blocked until `thread_control` says active and the owner resumes |
 | owner `stop` | Stopped: all live workers stopped, timers cleared; late results are recorded without a transition |
 | stage past 2x its projected duration (R12) | workers stopped, partial result recorded as a finding, next iteration or partial delivery |

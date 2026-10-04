@@ -9,7 +9,7 @@ import json
 from fridica_research import board
 from fridica_research.config import Board as BoardCfg
 from fridica_research.config import Config, Reviewer
-from support import OWNER, World, report, result
+from support import OWNER, PR, SHA, World, report, result
 from test_board import FakeGh
 
 BOOTSTRAP = Config(owner=OWNER, channels=("C0C2D3PCW20",), max_iterations=3, max_debate_rounds=2, settle_window=60, stage_timeout=4 * 3600,
@@ -104,8 +104,8 @@ def test_bootstrap_tape_with_signoffs_required_waits_then_delivers():
     assert w.state.audit_scopes["docs"]["reviewer"] is None and "docs" in w.kinds("delegate")[-1]["brief"]  # the uncovered scope goes to the local auditor
     w.finish("auditor", result(report=report(verdict="pass")))
     assert w.state.stage == "Audit" and w.state.phase == "signoff"
-    w.ev("sign_off", sender="U_A", pr="p", sha="s", verdict="approve")
-    w.ev("sign_off", sender="U_B", pr="p", sha="s", verdict="approve")
+    w.ev("sign_off", sender="U_A", pr=PR, sha=SHA, verdict="approve")
+    w.ev("sign_off", sender="U_B", pr="#9", sha="abc1234", verdict="approve")  # `#N` names the same PR
     assert w.state.stage == "Audit"
     w.tick(cfg.stage_timeout)  # U_C never answers: deliver with the missing sign-off listed
     assert w.state.stage == "Delivered" and w.state.audit["signoffs_missing"] == ["U_C"]

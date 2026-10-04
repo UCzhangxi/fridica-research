@@ -31,7 +31,7 @@ STAGE_ROLE = {"Explore": "explorer", "Claim": "driver", "Debate": "debater", "Im
 OVERRUN_FACTOR = 2.0
 PERSISTENT = ("mathematician", "physicist", "implementer")
 SLOT_CODES = ("too_many_workers", "worker_limit", "too many persistent workers")
-MAX_POST_TRIES = 3
+MAX_POST_TRIES = 3  # posts of the same text before a rate-limit/failure refusal becomes a stage failure (rule R)
 
 
 @dataclass(frozen=True)
@@ -170,7 +170,7 @@ class M:
         self.board()
 
     def row(self, stage: str) -> dict:
-        return {"stage": stage, "role": STAGE_ROLE[stage], "start": self.ev.now, "projected": self.cfg.projection[stage.lower()], "end": None, "actual": None}
+        return {"stage": stage, "role": STAGE_ROLE[stage], "iteration": self.s.iteration, "start": self.ev.now, "projected": self.cfg.projection[stage.lower()], "end": None, "actual": None}
 
     def arm_overrun(self):
         """R12: a job stage is interrupted at 2x its projected duration; one timer per stage run, kept across attempts."""
@@ -179,6 +179,13 @@ class M:
         if s.stage in JOB_STAGES and tid not in s.timers:
             s.timers[tid] = s.stage_log[-1]["start"] + OVERRUN_FACTOR * self.cfg.projection[s.stage.lower()]
             self.emit("arm_timer", tid, deadline=s.timers[tid])
+
+    def mirror_scopes(self):
+        """Keep the current audit row's copy of the scopes current, so each iteration's cards and hours pair with their own row."""
+        for row in reversed(self.s.stage_log):
+            if row["stage"] == "Audit":
+                row["scopes"] = copy.deepcopy(self.s.audit_scopes)
+                return
 
     def halt(self, stage: str, reason: str):
         """Blocked (owner-resumable) or Stopped: stop everything, keep the state."""
@@ -242,7 +249,7 @@ class M:
         s = self.s
         text, details = briefs.guard_post(text, details)
         action = {"thread": s.thread, "post_kind": kind, "text": text, "details": details}
-        s.phase, s.post_tries = "post", 0
+        s.phase, s.post_tries = "post", 1
         s.waiting = {"kind": "post", "id": self.aid(suffix), "action": action}
         self.emit("post", s.waiting["id"], **action)
 
@@ -291,12 +298,18 @@ class M:
         text = briefs.audit_request(self.aid("audit-request"), s.iteration, impl.get("pr", ""), impl.get("sha", ""), [(r.handle, r.focus) for r in self.cfg.reviewers], asks)
         self.emit("post", self.aid("audit-request"), thread=s.thread, post_kind="report", text=text, details=None)
         s.signoffs, s.audit = {}, {}
-        s.audit_scopes = {r.focus or f"review-{r.handle}": {"reviewer": r.handle, "verdict": None, "signed_at": None} for r in self.cfg.reviewers}
+        s.audit_scopes = {}
+        for r in self.cfg.reviewers:  # one entry per reviewer line, even when two lines name the same reviewer without a scope
+            key, n = r.focus or f"review-{r.handle}", 1
+            while key in s.audit_scopes: n, key = n + 1, f"{r.focus or f'review-{r.handle}'}-{n + 1}"
+            s.audit_scopes[key] = {"reviewer": r.handle, "verdict": None, "signed_at": None}
         local = self.cfg.uncovered_scopes()
         for scope in local: s.audit_scopes[scope] = {"reviewer": None, "verdict": None, "signed_at": None}
+        self.mirror_scopes()
         self.arm("timer", self.cfg.stage_timeout)
         if not local:
             s.phase, s.waiting, s.group = "signoff", None, None
+            if not self.cfg.require_signoffs: self.check_signoffs()  # nothing to wait for: no local auditor and sign-offs optional
             return
         brief = briefs.auditor(self.aid("audit"), s.problem, s.synthesis.get("synthesis", ""), impl.get("summary", ""), impl.get("machine_state"), s.findings, local)
         action = self.delegate("audit", "auditor", brief, ephemeral=True, backend=self.cfg.auditor_backend)
@@ -348,9 +361,14 @@ class M:
             self.peer_post()
             return
         if k == "sign_off":
+            if not head_matches(ev.get("pr", ""), ev.get("sha", ""), s.implementer.get("pr", ""), s.implementer.get("sha", "")):
+                # A sign-off names the head it reviewed; one for another PR or sha is noted, never counted.
+                s.findings.append(f"iteration {s.iteration} sign-off from {ev['sender']} ignored: {ev.get('pr')} {ev.get('sha')} is not the reviewed head {s.implementer.get('pr') or 'none'} {s.implementer.get('sha') or 'none'}")
+                return
             s.signoffs[ev["sender"]] = ev["verdict"]
             for sc in s.audit_scopes.values():
                 if sc["reviewer"] == ev["sender"] and sc["signed_at"] is None: sc.update(verdict=ev["verdict"], signed_at=ev.now)
+            self.mirror_scopes()
             self.board()
             if s.stage == "Audit" and s.phase == "signoff": self.check_signoffs()
             return
@@ -565,6 +583,7 @@ class M:
             peer = s.peer_claims.get(s.claim["slug"])
             if peer and ts_key(peer["ts"]) < ts_key(ev["ts"]): self.lose()
             else:
+                s.peer_claims.pop(s.claim["slug"], None)  # a later peer claim on our slug lost; the slug is ours, not taken
                 s.phase, s.waiting = "settle", {"kind": "timer", "id": self.arm("settle", self.cfg.settle_window)}
         elif kind == "study_result" and s.stage == "Deliver":
             s.waiting = None
@@ -588,10 +607,9 @@ class M:
                 self.post_result()
             else: self.retry(f"post refused by the egress gate: {code}")  # the same text cannot pass twice
             return
-        if s.post_tries + 1 >= MAX_POST_TRIES:
-            self.retry(f"post refused repeatedly: {code}")
+        if s.post_tries >= MAX_POST_TRIES:
+            self.retry(f"post refused {s.post_tries} times: {code}")
             return
-        s.post_tries += 1
         s.timers[self.aid("repost")] = self.ev.now + float(ev.get("retry_after") or 30)
         self.emit("arm_timer", self.aid("repost"), deadline=s.timers[self.aid("repost")])
 
@@ -600,6 +618,8 @@ class M:
         if ev.get("kind") != "study_claim": return
         c = contracts.parse_claim(ev.get("text", ""))
         if not c: return
+        ours = s.claim if s.claim and s.claim["slug"] == c.slug and s.claim.get("ts") else None
+        if ours and ts_key(ours["ts"]) < ts_key(ev["ts"]): return  # we hold the slug with the earlier ts: the peer lost, nothing is taken
         prev = s.peer_claims.get(c.slug)
         if not prev or ts_key(ev["ts"]) < ts_key(prev["ts"]): s.peer_claims[c.slug] = {"ts": ev["ts"], "sender": ev.get("sender", "")}
         if not s.claim or s.claim["slug"] != c.slug or s.stage in TERMINAL + ("Blocked",): return
@@ -615,6 +635,14 @@ class M:
         self.cancel("settle", "repost")
         s.waiting = None
         self.pick()
+
+
+def head_matches(pr: str, sha: str, reviewed_pr: str, reviewed_sha: str) -> bool:
+    """A sign-off counts only for the reviewed head: the same PR (URL, `#N` or `N`) and a prefix of the same sha; an unknown head cannot be matched and is accepted."""
+    def pr_id(x: str) -> str: return str(x).strip().rstrip("/").rsplit("/", 1)[-1].lstrip("#")
+    pr_ok = not reviewed_pr or pr_id(pr) == pr_id(reviewed_pr)
+    sha_ok = not reviewed_sha or (bool(sha) and reviewed_sha.lower().startswith(str(sha).lower()))
+    return pr_ok and sha_ok
 
 
 def ts_key(ts: str) -> tuple[int, int]:

@@ -4,7 +4,7 @@ import pytest
 from fridica_research import config
 
 TOML = '''
-channels = ["C0C2D3PCW20"]
+channels = ["C0123456789"]
 starters = ["U1"]
 max_iterations = 2
 max_debate_rounds = 1
@@ -50,7 +50,7 @@ def test_defaults():
 
 def test_full_file():
     c = config.parse(TOML)
-    assert c.channels == ("C0C2D3PCW20",) and c.starters == ("U1",) and c.max_iterations == 2 and c.max_debate_rounds == 1
+    assert c.channels == ("C0123456789",) and c.starters == ("U1",) and c.max_iterations == 2 and c.max_debate_rounds == 1
     assert c.auditor_backend == "codex" and not c.auto_followon and c.max_generations == 3
     assert c.stage_timeout == 5400 and c.settle_window == 30 and c.default_projected_hours == 4
     assert c.socket == "/tmp/x.sock" and c.capability_file == "~/cap" and c.owner == "UOWN"

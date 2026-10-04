@@ -9,6 +9,7 @@ OWNER, PEER, REV = "UOWNER", "UPEER", "UREV"
 CFG = Config(owner=OWNER, channels=("C1",), settle_window=60, stage_timeout=1000, reviewers=(Reviewer(REV, "scope"),), audit_scopes=("scope", "code"), people={OWNER: "chengcli", REV: "reviewer"}, require_signoffs=False,
              projection={"explore": 1200, "claim": 120, "debate": 1200, "implement": 5400, "audit": 5400, "deliver": 600})
 THREAD = "T1:C1:1700000000.000100"
+PR, SHA = "https://github.com/o/r/pull/9", "abc1234"  # the reviewed head: `World.to_audit` and `result()` defaults
 
 EXPLORER_REPORT = "Findings...\n\n## Approaches\n- alpha: Alpha design -- cheapest\n- beta: Beta design -- robust\n- gamma: Gamma design -- exotic\n"
 
@@ -112,7 +113,7 @@ class World:
             if self.state.stage != "Debate" or self.state.phase != "job": break
         return self.state
 
-    def to_audit(self, pr="https://github.com/o/r/pull/9"):
+    def to_audit(self, pr=PR):
         self.to_implement()
         self.finish("implementer", result(artifacts=[pr]))
         return self.state
