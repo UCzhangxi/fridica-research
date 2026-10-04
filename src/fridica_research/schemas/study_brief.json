@@ -1,0 +1,22 @@
+{
+  "title": "study_brief",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "brief",
+    "questions"
+  ],
+  "properties": {
+    "brief": {
+      "type": "string",
+      "description": "The explorer's brief for this iteration: the problem, what is known, what to map out."
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Concrete questions the explorer must answer."
+    }
+  }
+}
