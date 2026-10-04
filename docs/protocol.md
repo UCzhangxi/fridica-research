@@ -211,7 +211,8 @@ and the churn policy are in `tests/bootstrap/README.md`.
 ## R21. GitHub reviews are the sign-off
 
 Opt-in through `[github] enabled = true` (`github.py`; with it absent the driver behaves as
-R6 describes, Slack lines only). For the PR the implementer reported (`implementer.pr`) of a
+R6 describes, Slack lines only). GitHub reviews are polled by the driver directly and never pass
+through the Slack event feed. For the PR the implementer reported (`implementer.pr`) of a
 study in Audit, Deliver or Delivered, the driver polls every `poll_interval` (default 2 min) the
 PR's own fields (`gh pr view <n> -R <owner/repo> --json headRefOid,state,mergedAt,mergeCommit,author,milestone`)
 and its reviews from REST (`gh api --paginate repos/<owner>/<repo>/pulls/<n>/reviews`: `id`,
@@ -240,7 +241,10 @@ verdict by a login no Slack id maps to closes no card; it becomes a finding nami
 Each counted review is mirrored into the study thread as exactly one line,
 `SIGN-OFF (GitHub review, mirrored) <login>: <STATE> on <owner/repo>#<n> at <sha>`, with a
 `ref:` line; the marker makes `contracts.parse_signoff` return nothing for it, and own posts are
-never parsed for sign-offs, so the mirror is the record and never a second sign-off. Each post
+never parsed for sign-offs, so the mirror is the record and never a second sign-off. A mirrored
+review that GitHub later shows as `DISMISSED` on the current head is mirrored once more with that
+state, with a finding (`GitHub review by <login> ... was dismissed: it no longer counts toward the
+merge`); a dismissed verdict never counts for the merge. Each post
 and each review's events is marked seen (store meta) only after the driver delivered it (posted,
 applied to the machine); one that fails is delivered again on the next poll. The Slack
 `SIGN-OFF` line stays the fallback for reviewers without repository access. The audit verdict is
@@ -274,7 +278,8 @@ milestone=<number>`; milestones R1, R2, ... are created on demand).
 
 The merge exists only for `merge = "driver"`: once the open PR has at least one `APPROVED`
 verdict on the current head from a configured reviewer of the repository (not a bot, not the PR's
-author) and no non-bot `CHANGES_REQUESTED` verdict on it, the driver runs
+author) and no `CHANGES_REQUESTED` verdict on it from a configured reviewer (any other account's
+review is a finding only), the driver runs
 `gh pr merge <n> -R <o/r> --squash --match-head-commit <head>`, records that it merged, then the squash sha (from the view after the merge, or from the next poll's
 when that view fails) as the generation's revision (store meta `github:revision:<repo>:g<generation>`), and posts
 `merged <repo>#<n> (squash) as <sha> after approval by <logins> on <head>` in the thread. For an
@@ -289,9 +294,10 @@ configured reviewer of the repository on the current head (bots such as copilot,
 and accounts not in `[repos]` / `[audit]` reviewers never count). A merged PR stays polled
 for `post_merge_window` (default 7 days) after `mergedAt`. A `CHANGES_REQUESTED` review by a configured
 reviewer submitted after the merge is acknowledged automatically (once: the reply, the carry and the
-thread line are each recorded as done): one reply on the PR (`@<login> acknowledged, goes
+thread line are each recorded as done; a review is marked seen only once the reply succeeded, so a
+failed reply is tried again on the next poll): one reply on the PR (`@<login> acknowledged, goes
 into the next PR.`), one line in the study thread (`acknowledged, goes into the next PR: post-merge
-review by <login> on <repo>#<n>`), one finding per item of the review body
+review by <login> on <repo>#<n>`), one finding per item of the review body (each item cut at 500 characters)
 (`post-merge review by <login> on <repo>#<n>: <item>`), and the items are carried (store meta
 `github:carry:<repo>`) into the next PR body to that repository under
 `## From post-merge review by <login>`, cleared once that PR is opened. The reviewer's audit
