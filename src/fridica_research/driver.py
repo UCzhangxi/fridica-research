@@ -182,17 +182,17 @@ class Driver:
                 prompt = {"study_brief": lambda: briefs.prompt_brief(s.problem, s.iteration, s.findings, s.peer_claims), "study_synthesis": lambda: briefs.prompt_synthesis(s.problem, s.approach(), s.explorer_report, s.reports), "study_deliver": lambda: briefs.prompt_deliver(s.problem, s.approach(), s.synthesis.get("synthesis", ""), s.implementer.get("summary", ""), s.audit.get("summary", ""), s.findings, s.partial)}[name]()
                 self.apply(s.thread, self.run_llm(w["id"], name, prompt))
             elif w["kind"] in ("group", "slot"):
-                jobs = view.jobs_with_ref(w["id"])
-                if jobs and not s.group["jobs"]:
-                    self.apply(s.thread, Event("delegated", self.clock(), {"action_id": w["id"], "join_group": jobs[0].get("inbox_id") or "", "jobs": [{"job_id": j["id"], "worker_id": j.get("worker_id", ""), "role": j.get("role", "")} for j in jobs]}))
+                known = {j["role"] for j in s.group["jobs"].values()}
+                for a in w["actions"]:
+                    if a["role"] in known: continue
+                    jobs = view.jobs_with_ref(a["action_id"])
+                    if not jobs:
+                        for ev in self.execute(s, Action("delegate", a["action_id"], a)): self.apply(s.thread, ev)
+                        continue
+                    self.apply(s.thread, Event("delegated", self.clock(), {"action_id": a["action_id"], "join_group": jobs[0].get("inbox_id") or "", "jobs": [{"job_id": j["id"], "worker_id": j.get("worker_id", ""), "role": j.get("role", "")} for j in jobs]}))
                     for j in jobs:
                         if j.get("job_status") in ("finished", "failed", "interrupted"):
                             self.apply(s.thread, Event("job_result", self.clock(), {"job_id": j["id"], "attempt": j.get("attempt", 1), "job_status": j["job_status"], "code": j.get("error"), "worker_id": j.get("worker_id", ""), "role": j.get("role", ""), "join_group": j.get("inbox_id") or "", "result": j.get("result")}))
-                elif not jobs:
-                    sent = {j["role"] for j in s.group["jobs"].values()}
-                    for a in w["actions"]:
-                        if a["role"] not in sent:
-                            for ev in self.execute(s, Action("delegate", a["action_id"], a)): self.apply(s.thread, ev)
             elif w["kind"] == "post":
                 m = view.own_post_with_ref(w["id"], self.cfg.owner)
                 if m: self.apply(s.thread, Event("own_post_seen", self.clock(), {"ts": m["ts"], "kind": w["action"]["post_kind"], "text": m["text"]}))

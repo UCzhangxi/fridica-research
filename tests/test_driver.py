@@ -213,3 +213,28 @@ def test_full_study_through_the_driver(world):
     assert kinds == ["study_root", "study_claim", "report", "study_result"]
     child = drv.store.load(s.followon)
     assert child and child.generation == 2 and child.lineage == thread and child.stage == "Explore"
+
+
+def test_restart_mid_debate_pair_adopts_existing_jobs_and_resends_only_the_missing_one(world):
+    server, cfg = world
+    cfg = dataclasses.replace(cfg, settle_window=0)
+    thread = "T1:C1:1700000000.000100"
+    server.root(thread, OWNER, root_text())
+    drv = make_driver(cfg)
+    drain(drv)
+    server.finish_job(thread, server.job_of(thread, "explorer")["id"], result(report=EXPLORER_REPORT))
+    drain(drv)
+    s = drv.store.load(thread)
+    assert s.stage == "Debate" and len(s.group["jobs"]) == 2
+    # Crash after the snapshot that emitted the pair but before any `delegated` was applied; the physicist's POST was lost.
+    s.group["jobs"].clear()
+    s.group["pending"] = ["mathematician", "physicist"]
+    drv.store.save(s)
+    server.view(thread)["jobs"] = [j for j in server.view(thread)["jobs"] if j["role"] != "physicist"]
+    drv2 = make_driver(cfg, store=Store(cfg.state_file))
+    drain(drv2)
+    s2 = drv2.store.load(thread)
+    roles = sorted(j["role"] for j in server.view(thread)["jobs"] if j["job_status"] == "running")
+    assert roles == ["mathematician", "physicist"] and sorted(j["role"] for j in s2.group["jobs"].values()) == roles
+    assert s2.workers["mathematician"]["worker_id"] == server.job_of(thread, "mathematician")["worker_id"]  # adopted, not re-delegated
+    assert s2.phase == "job" and s2.waiting["kind"] == "group"
