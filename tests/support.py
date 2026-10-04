@@ -35,8 +35,8 @@ LLM = {
 class World:
     """Answers actions with the events the driver would feed: llm results, `delegated`, own-post echoes, timers."""
 
-    def __init__(self, cfg: Config = CFG, now: float = 1_700_000_000.0, auto_post: bool = True, auto_delegate: bool = True, llm=None):
-        self.cfg, self.now, self.auto_post, self.auto_delegate = cfg, now, auto_post, auto_delegate
+    def __init__(self, cfg: Config = CFG, now: float = 1_700_000_000.0, auto_post: bool = True, auto_delegate: bool = True, llm=None, hold: tuple[str, ...] = ()):
+        self.cfg, self.now, self.auto_post, self.auto_delegate, self.hold = cfg, now, auto_post, auto_delegate, hold
         self.llm = llm or (lambda name, prompt: LLM[name])
         self.state: machine.State | None = None
         self.actions: list[machine.Action] = []
@@ -78,7 +78,7 @@ class World:
                 self.workers[a["role"]] = wid
                 self.pending[a["role"]] = f"job-{self.jobs}"
                 self.ev("delegated", action_id=a.id, join_group=f"grp-{a.id}", jobs=[{"job_id": f"job-{self.jobs}", "worker_id": wid, "role": a["role"]}])
-            elif a.kind == "post" and self.auto_post:
+            elif a.kind == "post" and self.auto_post and a["post_kind"] not in self.hold:
                 self.ev("own_post_seen", ts=self.next_ts(), kind=a["post_kind"], text=a["text"])
 
     def finish(self, role: str, res: dict | None = None, job_status="finished", code=None):

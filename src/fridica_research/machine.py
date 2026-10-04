@@ -349,7 +349,7 @@ class M:
                     s.group["jobs"][j["job_id"]] = {"role": j["role"], "worker_id": j["worker_id"], "result": None}
                     s.workers[j["role"]] = {"worker_id": j["worker_id"], "live": True}
                     if j["role"] in s.group["pending"]: s.group["pending"].remove(j["role"])
-                s.waiting["kind"] = "group"
+                if not s.group["pending"]: s.waiting["kind"], s.phase = "group", "job"
             return
         if k == "delegate_refused":
             if not self.awaits(ev["action_id"]): return
@@ -531,10 +531,12 @@ class M:
         w = s.waiting
         if not (w and w["kind"] == "post" and ev.get("post_kind") == w["action"]["post_kind"]): return
         code = str(ev.get("code", ""))
-        if code.startswith("egress") and w["action"]["post_kind"] == "study_result" and not s.redacted:
-            s.redacted = True
-            self.notify(f"the deliverable was refused by the egress gate ({code}); posting a redacted version")
-            self.post_result()
+        if code.startswith("egress"):
+            if w["action"]["post_kind"] == "study_result" and not s.redacted:
+                s.redacted = True
+                self.notify(f"the deliverable was refused by the egress gate ({code}); posting a redacted version")
+                self.post_result()
+            else: self.retry(f"post refused by the egress gate: {code}")  # the same text cannot pass twice
             return
         if s.post_tries + 1 >= MAX_POST_TRIES:
             self.retry(f"post refused repeatedly: {code}")

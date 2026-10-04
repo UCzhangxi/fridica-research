@@ -36,6 +36,7 @@ class Board:
     number: int = 0
     repo: str = ""  # owner/name of the study repository where cards are real issues
     token_env: str = "GH_TOKEN"
+    owner_type: str = "user"  # user | organization
 
 
 @dataclass(frozen=True)
@@ -87,7 +88,7 @@ def parse(text: str) -> Config:
         max_generations=int(raw.get("max_generations", 5)), stage_timeout=duration(raw.get("stage_timeout"), 7200.0),
         settle_window=duration(raw.get("settle_window"), 60.0), idle_sleep=duration(raw.get("idle_sleep"), 2.0),
         default_projected_hours=float(raw.get("default_projected_hours", 4.0)), projection=proj,
-        board=Board(bool(b.get("enabled", False)), str(b.get("owner", "")), int(b.get("number", 0)), str(b.get("repo", "")), str(b.get("token_env", "GH_TOKEN"))),
+        board=Board(bool(b.get("enabled", False)), str(b.get("owner", "")), int(b.get("number", 0)), str(b.get("repo", "")), str(b.get("token_env", "GH_TOKEN")), str(b.get("owner_type", "user"))),
         reviewers=reviewers, require_signoffs=bool(a.get("require_signoffs", True)),
         people={str(k): str(v) for k, v in raw.get("people", {}).items()}, llm_model=str(raw.get("llm_model", "haiku")),
     )
