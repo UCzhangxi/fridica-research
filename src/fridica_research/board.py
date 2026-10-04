@@ -6,9 +6,13 @@ the query and its variables go to gh as one JSON document on stdin (`--input -`)
 no `gh project` subcommands for values; `gh project field-create` only creates missing fields
 once (there is no GraphQL mutation for that). `gh issue create|edit|close` manage the issues.
 
-Projection (R9): one real issue per study (parent) and one per stage run (sub-issue via
-`addSubIssue`), each a project item carrying Stage, Started, Projected finish, Projected hours,
-Actual hours, Finished, Workers, Thread and an assignee. R10: the Roadmap view draws Started ->
+Projection (R9, R12, R13): one plain issue per study and one per stage run whose body names the
+study (`Study: #N`; no sub-issue hierarchy), each a project item carrying Stage, Role, Status,
+Started, Projected finish, Projected hours, Actual hours, Finished, Workers, Thread and exactly
+one assignee. The audit stage is one card per audit scope: a peer reviewer's card is assigned to
+that reviewer and closes on their SIGN-OFF line; the local auditor's card (only for scopes no
+peer takes) closes with the stage. R14: the built-in Status follows the machine (Todo ahead of
+the stage, In Progress with Started, Done with Finished). R10: the Roadmap view draws Started ->
 Projected finish; its date fields cannot be set through the API (docs/protocol.md has the
 one-time setup). `Reviewers` is reserved by Projects v2, hence `Peer reviewers`.
 `sync` never raises into the driver: failures are logged and retried on the next transition.
@@ -29,8 +33,11 @@ from .machine import State
 log = logging.getLogger("fridica_research.board")
 Runner = Callable[[list[str], str | None], str]  # (argv, stdin) -> stdout
 STAGE_OPTIONS = ("Explore", "Claim", "Debate", "Implement", "Audit", "Deliver", "Delivered", "Stopped")
+ROLE_OPTIONS = ("explorer", "debater", "implementer", "auditor", "driver", "peer-reviewer")
+STATUS = {"todo": "Todo", "in_progress": "In Progress", "done": "Done"}  # the built-in Status field's default options
+OPTIONS = {"Stage": STAGE_OPTIONS, "Role": ROLE_OPTIONS}
 FIELDS = {
-    "Stage": "SINGLE_SELECT", "Iteration": "NUMBER", "Generation": "NUMBER", "Projected hours": "NUMBER", "Actual hours": "NUMBER",
+    "Stage": "SINGLE_SELECT", "Role": "SINGLE_SELECT", "Iteration": "NUMBER", "Generation": "NUMBER", "Projected hours": "NUMBER", "Actual hours": "NUMBER",
     "Started": "DATE", "Projected finish": "DATE", "Finished": "DATE",
     "Owner": "TEXT", "Approach": "TEXT", "Workers": "TEXT", "Result": "TEXT", "Thread": "TEXT", "Follow-on": "TEXT", "Peer reviewers": "TEXT",
 }
@@ -42,7 +49,6 @@ Q_ITEMS = {kind: "query($owner:String!,$number:Int!,$after:String){%s(login:$own
 Q_ISSUE = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){id}}}"
 Q_VERIFY = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issue(number:$number){projectItems(first:20){nodes{project{number} started:fieldValueByName(name:\"Started\"){... on ProjectV2ItemFieldDateValue{date}} projected_finish:fieldValueByName(name:\"Projected finish\"){... on ProjectV2ItemFieldDateValue{date}} finished:fieldValueByName(name:\"Finished\"){... on ProjectV2ItemFieldDateValue{date}} projected_hours:fieldValueByName(name:\"Projected hours\"){... on ProjectV2ItemFieldNumberValue{number}} actual_hours:fieldValueByName(name:\"Actual hours\"){... on ProjectV2ItemFieldNumberValue{number}} stage:fieldValueByName(name:\"Stage\"){... on ProjectV2ItemFieldSingleSelectValue{name}}}}}}}"
 M_ADD_ITEM = "mutation($project:ID!,$content:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$content}){item{id}}}"
-M_SUB_ISSUE = "mutation($parent:ID!,$child:ID!){addSubIssue(input:{issueId:$parent,subIssueId:$child}){issue{id}}}"
 _SET = "mutation($project:ID!,$item:ID!,$field:ID!,$%s:%s){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{%s:$%s}}){projectV2Item{id}}}"
 M_SET_DATE = _SET % ("date", "Date!", "date", "date")
 M_SET_NUMBER = _SET % ("v", "Float!", "number", "v")
@@ -113,7 +119,7 @@ class Projects:
         missing = [n for n in FIELDS if n not in self.project().fields]
         for name in missing:
             argv = ["gh", "project", "field-create", str(self.b.number), "--owner", self.b.owner, "--name", name, "--data-type", FIELDS[name]]
-            if FIELDS[name] == "SINGLE_SELECT": argv += ["--single-select-options", ",".join(STAGE_OPTIONS)]
+            if FIELDS[name] == "SINGLE_SELECT": argv += ["--single-select-options", ",".join(OPTIONS[name])]
             self.run(argv, None)
         if missing: self._project = self.discover(self.b.owner, self.b.number, refresh=True)
 
@@ -177,7 +183,7 @@ class Projects:
         self.remember(f"board:item:{self.b.repo}#{issue}", item)
         return item
 
-    def add_sub_issue(self, parent: int, child: int): self.graphql(M_SUB_ISSUE, parent=self.issue_id(parent), child=self.issue_id(child))
+    def set_status(self, issue: int, key: str): self.set_option(issue, "Status", STATUS[key])  # R14: Status is built in, discovered like any field
     def edit_issue(self, number: int, *args: str): self.run(["gh", "issue", "edit", str(number), "-R", self.b.repo, *args], None)
     def close_issue(self, number: int): self.run(["gh", "issue", "close", str(number), "-R", self.b.repo], None)
 
@@ -195,8 +201,26 @@ def _dur(s): return f"{int(s // 3600)}:{int(s % 3600 // 60):02d}" if s is not No
 def _workers(state: State) -> str: return ", ".join(f"{r}={w['worker_id']}" for r, w in sorted(state.workers.items()))
 
 
+def role_totals(state: State) -> dict[str, dict[str, float]]:
+    """R12: projected and actual hours per role for one study (hours, from the stage log and the audit scopes)."""
+    out: dict[str, dict[str, float]] = {}
+    def add(role, projected, actual):
+        r = out.setdefault(role, {"projected": 0.0, "actual": 0.0})
+        r["projected"] += projected / 3600
+        r["actual"] += (actual or 0) / 3600
+    for row in state.stage_log:
+        if row["stage"] != "Audit":
+            add(row.get("role", "driver"), row["projected"], row["actual"])
+            continue
+        for sc in state.audit_scopes.values():
+            if sc["reviewer"]: add("peer-reviewer", row["projected"], (sc["signed_at"] - row["start"]) if sc["signed_at"] else None)
+            else: add("auditor", row["projected"], row["actual"])
+        if not state.audit_scopes: add("auditor", row["projected"], row["actual"])
+    return {k: {m: round(v, 2) for m, v in r.items()} for k, r in out.items()}
+
+
 class Board:
-    """Mirrors a study onto the project: parent issue plus one sub-issue per stage run (R9)."""
+    """Mirrors a study onto the project: one plain issue per study, one per stage run, one per audit scope (R9, R13)."""
 
     def __init__(self, cfg: Config, runner: Runner | None = None, remember=lambda k, v: None, recall=lambda k: None, issue_numbers: dict | None = None):
         self.cfg, self.b = cfg, cfg.board
@@ -204,7 +228,7 @@ class Board:
         self.remember, self.recall = remember, recall
         self.issue_numbers = issue_numbers or {}  # thread/channel -> issue number given by `start --issue N`
 
-    def login(self, slack_id: str, state: State) -> str: return state.people.get(slack_id) or self.cfg.people.get(slack_id, "")
+    def login(self, slack_id: str, state: State) -> str: return self.cfg.login_of(slack_id, state.people)
     def title(self, state: State) -> str: return state.problem.strip().splitlines()[0][:80] if state.problem.strip() else state.thread
 
     def sync(self, state: State):
@@ -216,12 +240,32 @@ class Board:
             self.sync_study(state, cards)
             self.sync_stages(state, cards)
             if state.stage in ("Delivered", "Stopped") and not cards.get("closed"):
-                self.api.close_issue(cards["issue"])
+                self.close(cards["issue"], day(state.finished_at or state.stage_log[-1]["end"]), ((state.finished_at or state.stage_log[-1]["end"] or state.started_at) - state.started_at) / 3600)
                 cards["closed"] = True
         except Exception as e:  # noqa: BLE001 - the board must never stall a stage
             log.warning("board update failed for %s: %s", state.thread, e)
         finally:
             self.remember(key, json.dumps(cards))
+
+    def open_card(self, title: str, body: str, assignee: str, role: str, stage: str, start: float, projected: float, state: State) -> int:
+        """A plain issue with exactly one assignee (or none, never the owner on a peer's card), In Progress from creation."""
+        number = self.api.create_issue(title, body, assignee)
+        self.api.add_to_project(number)
+        self.api.set_option(number, "Stage", stage)
+        self.api.set_option(number, "Role", role)
+        self.api.set_status(number, "in_progress")
+        self.api.set_dates(number, started=day(start), projected_finish=day(start + projected))
+        self.api.set_number(number, "Projected hours", round(projected / 3600, 2))
+        self.api.set_number(number, "Iteration", state.iteration)
+        self.api.set_number(number, "Generation", state.generation)
+        self.api.set_text(number, "Thread", state.thread)
+        return number
+
+    def close(self, number: int, finished: str | None, actual_hours: float):
+        self.api.set_dates(number, finished=finished)
+        self.api.set_number(number, "Actual hours", round(actual_hours, 2))
+        self.api.set_status(number, "done")
+        self.api.close_issue(number)
 
     def sync_study(self, state: State, cards: dict):
         owner_login = self.login(self.cfg.owner, state)
@@ -231,13 +275,15 @@ class Board:
             if given:
                 number = int(given)
                 self.api.edit_issue(number, "--body", body, *(["--add-assignee", owner_login] if owner_login else []))
-            else: number = self.api.create_issue(self.title(state), body, owner_login)
+                self.api.add_to_project(number)
+                self.api.set_option(number, "Role", "driver")
+                self.api.set_status(number, "in_progress")
+                self.api.set_dates(number, started=day(state.started_at), projected_finish=day(state.started_at + state.projected_hours * 3600))
+                self.api.set_number(number, "Projected hours", state.projected_hours)
+                self.api.set_number(number, "Generation", state.generation)
+                self.api.set_text(number, "Thread", state.thread)
+            else: number = self.open_card(self.title(state), body, owner_login, "driver", "Explore", state.started_at, state.projected_hours * 3600, state)
             cards["issue"] = number
-            self.api.add_to_project(number)
-            self.api.set_dates(number, started=day(state.started_at), projected_finish=day(state.started_at + state.projected_hours * 3600))
-            self.api.set_number(number, "Projected hours", state.projected_hours)
-            self.api.set_number(number, "Generation", state.generation)
-            self.api.set_text(number, "Thread", state.thread)
             if owner_login: self.api.set_text(number, "Owner", owner_login)
         else: self.api.edit_issue(cards["issue"], "--body", body)
         n = cards["issue"]
@@ -245,29 +291,40 @@ class Board:
         self.api.set_number(n, "Iteration", state.iteration)
         for field, value in (("Approach", (state.claim or {}).get("slug")), ("Workers", _workers(state)), ("Result", state.notes[-1] if state.stage in ("Stopped", "Blocked") and state.notes else state.deliverable.get("summary", "")[:500]), ("Follow-on", state.followon), ("Peer reviewers", ", ".join(filter(None, (self.login(r.handle, state) for r in self.cfg.reviewers))))):
             if value: self.api.set_text(n, field, value)
-        if state.finished_at:
-            self.api.set_dates(n, finished=day(state.finished_at))
-            self.api.set_number(n, "Actual hours", round((state.finished_at - state.started_at) / 3600, 2))
+
+    def audit_cards(self, state: State, row: dict, cards: dict) -> list[dict]:
+        """R13: one card per audit scope; peers' cards go to the peer (never to the owner), the local auditor's to the owner."""
+        out = []
+        for scope, sc in state.audit_scopes.items():
+            if sc["reviewer"]:
+                login = self.login(sc["reviewer"], state)
+                number = self.open_card(f"Audit {scope} (iteration {state.iteration}): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nAudit scope: {scope}. Reply `SIGN-OFF <pr> <sha> approve|changes` in the study thread.", login, "peer-reviewer", "Audit", row["start"], row["projected"], state)
+                out.append({"issue": number, "closed": False, "scope": scope, "assignee": login})
+            else:
+                number = self.open_card(f"Audit {scope} (iteration {state.iteration}, local auditor): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nAudit scope: {scope}, by the owner's auditor worker.", self.login(self.cfg.owner, state), "auditor", "Audit", row["start"], row["projected"], state)
+                out.append({"issue": number, "closed": False, "scope": scope, "assignee": self.login(self.cfg.owner, state)})
+        return out
 
     def sync_stages(self, state: State, cards: dict):
         owner_login = self.login(self.cfg.owner, state)
         stages = cards.setdefault("stages", [])
         for i, row in enumerate(state.stage_log):
             if i >= len(stages):
-                number = self.api.create_issue(f"{row['stage']} (iteration {state.iteration}): {self.title(state)}"[:120], f"Stage run {i + 1} of {state.thread}; parent #{cards['issue']}.", owner_login)
-                self.api.add_sub_issue(cards["issue"], number)
-                self.api.add_to_project(number)
-                self.api.set_option(number, "Stage", row["stage"])
-                self.api.set_dates(number, started=day(row["start"]), projected_finish=day(row["start"] + row["projected"]))
-                self.api.set_number(number, "Projected hours", round(row["projected"] / 3600, 2))
-                self.api.set_number(number, "Iteration", state.iteration)
-                self.api.set_number(number, "Generation", state.generation)
-                self.api.set_text(number, "Thread", state.thread)
-                stages.append({"issue": number, "closed": False})
-            card = stages[i]
-            if row["end"] is not None and not card["closed"]:
-                self.api.set_dates(card["issue"], finished=day(row["end"]))
-                self.api.set_number(card["issue"], "Actual hours", round(row["actual"] / 3600, 2))
-                if _workers(state): self.api.set_text(card["issue"], "Workers", _workers(state))
-                self.api.close_issue(card["issue"])
+                if row["stage"] == "Audit": stages.append({"cards": self.audit_cards(state, row, cards)})
+                else:
+                    number = self.open_card(f"{row['stage']} (iteration {state.iteration}): {self.title(state)}"[:120], f"Study: #{cards['issue']}\nStage run {i + 1} of {state.thread}.", owner_login, row.get("role", "driver"), row["stage"], row["start"], row["projected"], state)
+                    stages.append({"cards": [{"issue": number, "closed": False, "scope": None, "assignee": owner_login}]})
+            for card in stages[i]["cards"]:
+                if card["closed"]: continue
+                sc = state.audit_scopes.get(card["scope"]) if card["scope"] else None
+                if sc and sc["reviewer"]:
+                    if not card["assignee"] and self.login(sc["reviewer"], state):
+                        card["assignee"] = self.login(sc["reviewer"], state)
+                        self.api.edit_issue(card["issue"], "--add-assignee", card["assignee"])
+                    if sc["signed_at"] is None: continue  # closes on the assignee's SIGN-OFF line, not before
+                    self.close(card["issue"], day(sc["signed_at"]), (sc["signed_at"] - row["start"]) / 3600)
+                elif row["end"] is not None:
+                    if _workers(state) and not card["scope"]: self.api.set_text(card["issue"], "Workers", _workers(state))
+                    self.close(card["issue"], day(row["end"]), row["actual"] / 3600)
+                else: continue
                 card["closed"] = True

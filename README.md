@@ -52,8 +52,9 @@ number = 8
 repo = "chengcli/fridica-research"  # study and stage cards are real issues here
 token_env = "GH_TOKEN"
 
-[audit]
-reviewers = [{handle = "U0AAAAAAA", focus = "numerics"}, {handle = "U0BBBBBBB", focus = "scope"}]
+[audit]                             # one audit card per scope, assigned to its reviewer (R13)
+reviewers = [{slack = "U0AAAAAAA", login = "alice", scope = "numerics"}, {slack = "U0BBBBBBB", login = "bob", scope = "scope"}]
+scopes = ["numerics", "scope", "api"]   # "api" has no peer: the owner's auditor worker takes it
 require_signoffs = true
 
 [people]                            # Slack user id -> GitHub login
@@ -67,6 +68,7 @@ fridica-research start C0C2D3PCW20 "Study X" --projected-hours 3 [--issue 12]
 fridica-research list [--board]
 fridica-research stop <workspace:channel:root_ts>
 fridica-research resume <thread>             # after a Blocked study is fixed
+fridica-research note <thread> "R9: ..."     # a mid-stage change: a finding for this iteration, never sent to a running worker
 ```
 
 Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/delegate`,
@@ -94,7 +96,7 @@ Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/d
 - `contracts.py`: the pinned routes, event shapes and text-line formats (`ref:`, claims, roots, `## Stance`).
 - `briefs.py` + `schemas/`: brief templates and the three LLM JSON schemas, with a size guard.
 - `driver.py`, `client.py`, `store.py`, `board.py`, `config.py`, `cli.py`.
-- [docs/protocol.md](docs/protocol.md): the protocol R1-R12 as the driver runs it.
+- [docs/protocol.md](docs/protocol.md): the protocol R1-R14 as the driver runs it.
 
 ## First study
 
@@ -103,7 +105,8 @@ The package's own bootstrap was the first study, run by hand and then replayed b
 
 - Slack thread: https://athena-snap.slack.com/archives/C0C2D3PCW20/p1791125606982449
 - Board: https://github.com/users/chengcli/projects/8, study card
-  https://github.com/chengcli/fridica-research/issues/1 with stage cards #2-#7.
+  https://github.com/chengcli/fridica-research/issues/1 with one plain issue per stage run
+  (the tape expects #2-#5 Explore..Implement, #6-#8 one audit card per reviewer, #9 Deliver).
 
 ## Development
 
@@ -122,7 +125,6 @@ fold-equivalence check (`test_rebuild.py`) and the bootstrap tape.
 
 - Fridica's PR B routes and `job_result`/`peer_post` events are pinned, not yet served; today's
   `job` events are joined with `GET /threads/<id>` for the result.
-- R12 (per-stage `Role` field, mid-stage requirement changes as findings, 2x projected-time
-  interrupt) is documented in `docs/protocol.md` and not implemented.
+- The board never writes Status `Todo`: no card is created ahead of its stage.
 - Slug equivalence across different explorers is by exact name only.
 - Owner-stop does not post a `released` claim; peers keep treating the slug as taken.

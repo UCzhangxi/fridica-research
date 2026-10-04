@@ -1,7 +1,7 @@
 # The study protocol, as the driver runs it
 
 This is what `fridica-research serve` does for every study. It was written from the owner's
-requirements of the bootstrap run (R1-R12, 2026-10-04) and the design decisions of the bootstrap
+requirements of the bootstrap run (R1-R14, 2026-10-04, iterations 1 and 2) and the design decisions of the bootstrap
 debate (chengcli/fridica#126); the requirements are stated here as behaviour, not as instructions
 to a human. Source of truth for each rule is the code named beside it.
 
@@ -29,7 +29,7 @@ executing an action comes back as an event (`delegated`, `delegate_refused`, `ll
 
 Every stage change that produces a message posts it through fridica's `post` route with meta
 `kind` in `study_claim | study_result | study_root | report` and a readable
-`Stage: <name> (iteration N)` first line: the claim, the audit request (PR, SHA, reviewers), the
+`Stage: <name> (iteration N)` first line: the claim, the audit request (PR, SHA, reviewers and scopes), the
 delivery (summary, approach, PR, SHA, audit verdict, projected vs actual, stage table), and the
 out-of-scope notice on a rejected audit. Humans and peer bots are @-mentioned only on the root
 post and on the audit request. Every post and every brief carries a `ref: <ActionId>` line,
@@ -55,12 +55,12 @@ replies are never parsed as claims; only `study_claim` metadata from another own
 Opt-in through `[board] enabled, owner, number, repo, token_env` in `research.toml`. The study
 is a real issue in `repo` (`gh issue create`, or the issue given to `start --issue N`), added to
 the project with `addProjectV2ItemById`; each stage run (Explore, Claim, Debate, Implement,
-Audit, Deliver, per iteration) is its own issue, created when the stage starts, added as a
-sub-issue (`addSubIssue`) and as its own project item, closed when the stage ends. Fields, as on
-project 8: Stage (single select: Explore, Claim, Debate, Implement, Audit, Deliver, Delivered,
-Stopped), Iteration, Generation, Projected hours, Actual hours (number), Started, Projected
-finish, Finished (date), Owner, Approach, Workers, Result, Thread, Follow-on, Peer reviewers
-(text; `Reviewers` is reserved). Missing fields are created once with `gh project field-create`.
+Audit per scope, Deliver, per iteration) is its own plain issue (R13), created when the stage
+starts and added as its own project item, closed when the stage ends. Fields, as on project 8:
+Stage (single select: Explore, Claim, Debate, Implement, Audit, Deliver, Delivered, Stopped),
+Role (single select, R12), Status (built in, R14), Iteration, Generation, Projected hours,
+Actual hours (number), Started, Projected finish, Finished (date), Owner, Approach, Workers,
+Result, Thread, Follow-on, Peer reviewers (text; `Reviewers` is reserved). Missing fields are created once with `gh project field-create`.
 Values go through `updateProjectV2ItemFieldValue` with typed GraphQL variables (`$date: Date!`,
 `$v: Float!`), sent to `gh api graphql --input -` as one JSON document (gh's `-F` turns floats
 into strings). `board.Projects` is the client (`discover`, `item_for_issue`, `set_dates`,
@@ -101,12 +101,13 @@ is the single seam).
 ## R6. Audit by peers
 
 Entering Audit posts the PR link and exact head SHA (from the implementer's `machine_state` and
-artifacts), @-mentions the `[audit] reviewers` with their focus, states the sign-off line format,
-and delegates the auditor worker (ephemeral, `auditor_backend`, default `other`). Human replies
-containing `SIGN-OFF <pr> <sha> approve|changes` are recorded. With `require_signoffs = true`
-(default) the stage waits after the auditor's `pass` until every configured reviewer has signed
-off; `changes` sends the study to the next iteration; the stage timer ends the wait and delivers
-with the missing sign-offs listed. The auditor's verdict comes from the `## Stance` block
+artifacts), @-mentions the `[audit] reviewers` with their scope, states the sign-off line format,
+and delegates the auditor worker (ephemeral, `auditor_backend`, default `other`) only for the
+scopes no peer takes (R13). Human replies containing `SIGN-OFF <pr> <sha> approve|changes` from
+a configured reviewer are recorded on that reviewer's scope. With `require_signoffs = true`
+(default) the stage waits (after the local auditor's `pass`, if any) until every peer scope is
+signed off; `changes` sends the study to the next iteration; the stage timer or the 2x overrun
+ends the wait and delivers with the missing sign-offs listed. The auditor's verdict comes from the `## Stance` block
 (`verdict: pass|return|reject`); missing counts as `return`; `reject` posts an out-of-scope notice
 and stops the study. The driver never merges.
 
@@ -124,14 +125,59 @@ reviewers' logins. `[people]` maps Slack user ids to logins; when a reviewer's l
 the audit request asks `@user please reply with your GitHub login` and a bare `@login` /
 `github: login` reply from that user is recorded in the study state.
 
-## R12. Workload across roles (documented, not yet implemented)
+## R12. Workload across roles
 
-The owner's later correction asks for a `Role` single-select on each stage card (explorer,
-debater, implementer, auditor, driver, peer-reviewer) with per-role totals in `list --board`, for
-requirement changes that arrive mid-stage to become findings for the next iteration instead of
-being injected into the running worker, for briefs bounded to the stage's own output, and for a
-stage that exceeds 2x its projected time to be interrupted with its partial result as a finding.
-None of this is implemented in this bootstrap; see the README's limitations.
+Every card carries a `Role` single-select (explorer, debater, implementer, auditor, driver,
+peer-reviewer), set at creation: the study card and the Claim and Deliver cards are `driver`,
+Explore `explorer`, Debate `debater`, Implement `implementer`, a local audit card `auditor`,
+a peer's audit card `peer-reviewer`. `fridica-research list --board` prints projected and
+actual hours per role for each study (`board.role_totals`, from the stage log and the audit
+scopes; a peer reviewer's actual time is the latency from audit start to their sign-off).
+
+Requirement or design changes that arrive while a stage runs are never injected into the
+running worker. `fridica-research note <thread> "<text>"` queues a `finding` event; the machine
+appends it to the current iteration's findings (`iteration N note during <Stage>: ...`), the
+auditor's brief checks the implementation against the findings, and unmet ones travel into the
+next iteration's explorer brief and debate briefs. Each role's brief is bounded to its stage
+output (explorer: findings and `## Approaches`; debaters: analysis and `## Stance`; implementer:
+the synthesis only; auditor: verdict and findings).
+
+A job stage (Explore, Debate, Implement, Audit) that runs past **2x its projected duration** is
+interrupted: one `overrun` timer per stage run (kept across retry attempts), armed at
+`stage start + 2 x [projection]`; when it fires the stage's workers are stopped, the finished
+parts (job summaries, debate reports) become a finding
+(`<Stage> interrupted after M min (2x the projected P min); partial result: ...`), and the loop
+moves to the next iteration (or a partial delivery at `max_iterations`). In the Audit sign-off
+wait the overrun delivers with the missing sign-offs listed. Claim and Deliver have no worker
+and are bounded by the stage timer only.
+
+## R13. Plain issues, one owner per card, no duplicated responsibility
+
+Stage cards are plain issues in the study repository whose body starts with `Study: #N`;
+there is no sub-issue hierarchy. Every card has exactly one assignee, the single authority for
+its deliverable: the owner's driver (its GitHub login) for Explore, Claim, Debate, Implement,
+Deliver and the local audit; the peer reviewer for their audit card. The driver never adds a
+second assignee and never assigns the owner to a peer's card: when the peer's login is unknown
+the card is created unassigned, the audit request asks for the login in the thread, and the
+card gets its one assignee once the reply is recorded.
+
+The audit stage is one card per audit scope. `[audit] reviewers` entries carry the Slack id,
+the GitHub login and the scope they take (`{slack, login, scope}`); `[audit] scopes` lists all
+scopes (default: the reviewers' scopes). The driver runs a local auditor worker only for the
+scopes no peer takes (`Config.uncovered_scopes`; with no reviewers at all, one local audit);
+with every scope taken no auditor worker is delegated. A peer's card closes (Finished = sign-off
+day, Actual hours = sign-off latency, Status Done) when that reviewer's
+`SIGN-OFF <pr> <sha> approve|changes` line appears in the thread, not before, even after the
+study has delivered; the local audit card closes with the stage. `changes` from any peer returns
+the study to the next iteration.
+
+## R14. Status follows the machine
+
+The project's built-in `Status` single-select is discovered with the other fields and kept in
+step with the machine: `In Progress` when a card is created (the same transition that sets
+Started; the study card from the root post to delivery), `Done` when it closes (with Finished
+and Actual hours). `Todo` is reserved for cards created ahead of their stage; the driver creates
+no card before its stage starts, so it never writes it.
 
 ## Failure handling
 
@@ -145,6 +191,7 @@ None of this is implemented in this bootstrap; see the README's limitations.
 | post rate-limited/failed | re-post after `retry_after` (default 30 s), up to three tries; never an LLM re-run |
 | thread paused/closed/archived | Blocked until `thread_control` says active and the owner resumes |
 | owner `stop` | Stopped: all live workers stopped, timers cleared; late results are recorded without a transition |
+| stage past 2x its projected duration (R12) | workers stopped, partial result recorded as a finding, next iteration or partial delivery |
 
 ## Follow-on and generations
 

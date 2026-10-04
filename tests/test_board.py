@@ -14,7 +14,9 @@ from support import CFG, World
 BCFG = dataclasses.replace(CFG, board=BoardCfg(enabled=True, owner="chengcli", number=8, repo="chengcli/fridica-research"))
 PROJECT = {"id": "PVT_1", "fields": {"nodes": [
     {"id": "F_stage", "name": "Stage", "dataType": "SINGLE_SELECT", "options": [{"id": f"O_{n}", "name": n} for n in board.STAGE_OPTIONS]},
-    *[{"id": f"F_{n.replace(' ', '_')}", "name": n, "dataType": k} for n, k in board.FIELDS.items() if n != "Stage"],
+    {"id": "F_role", "name": "Role", "dataType": "SINGLE_SELECT", "options": [{"id": f"R_{n}", "name": n} for n in board.ROLE_OPTIONS]},
+    {"id": "F_status", "name": "Status", "dataType": "SINGLE_SELECT", "options": [{"id": f"S_{n}", "name": n} for n in ("Todo", "In Progress", "Done")]},
+    *[{"id": f"F_{n.replace(' ', '_')}", "name": n, "dataType": k} for n, k in board.FIELDS.items() if n not in ("Stage", "Role")],
 ]}}
 
 
@@ -47,7 +49,6 @@ class FakeGh:
             return {"user": {"projectV2": {"id": PROJECT["id"], "fields": {"nodes": nodes}}}}
         if query == board.Q_ISSUE: return {"repository": {"issue": {"id": f"I_{v['number']}"}}}
         if query == board.M_ADD_ITEM: return {"addProjectV2ItemById": {"item": {"id": "PVTI_" + v["content"]}}}
-        if query == board.M_SUB_ISSUE: return {"addSubIssue": {"issue": {"id": v["parent"]}}}
         if query in (board.M_SET_DATE, board.M_SET_NUMBER, board.M_SET_TEXT, board.M_SET_OPTION): return {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": v["item"]}}}
         if query == board.Q_ITEMS["user"]: return {"user": {"projectV2": {"items": {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"id": "PVTI_I_3", "content": {"number": 3, "repository": {"name": "fridica-research"}}}]}}}}
         if query == board.Q_VERIFY: return {"repository": {"issue": {"projectItems": {"nodes": [{"project": {"number": 8}, "started": {"date": "2026-10-04"}, "projected_finish": {"date": "2026-10-04"}, "finished": None, "projected_hours": {"number": 4.0}, "actual_hours": None, "stage": {"name": "Explore"}}]}}}}
@@ -70,6 +71,7 @@ def test_discover_is_one_query_and_cached():
     assert gh.calls[0][0] == ["gh", "api", "graphql", "--input", "-"]
     assert gh.calls[0][1] == {"query": board.Q_DISCOVER["user"], "variables": {"owner": "chengcli", "number": 8}}
     assert ids.id == "PVT_1" and ids.fields["Stage"]["options"]["Explore"] == "O_Explore" and ids.fields["Started"]["dataType"] == "DATE"
+    assert ids.fields["Role"]["options"]["peer-reviewer"] == "R_peer-reviewer" and ids.fields["Status"]["options"]["In Progress"] == "S_In Progress"
     assert "board:project:chengcli/8" in meta
     b.api.discover("chengcli", 8)
     assert len(gh.calls) == 1
@@ -100,47 +102,93 @@ def test_verify_reads_field_values_by_name():
 
 
 def test_missing_fields_are_created_once():
-    gh = FakeGh(fields_missing=("Peer reviewers", "Finished"))
+    gh = FakeGh(fields_missing=("Peer reviewers", "Finished", "Role"))
     b, gh, _ = make(gh)
     b.api.ensure_fields()
     creates = gh.argv("gh", "project", "field-create")
-    assert [c[c.index("--name") + 1] for c in creates] == ["Finished", "Peer reviewers"]
-    assert creates[0][creates[0].index("--data-type") + 1] == "DATE"
+    assert [c[c.index("--name") + 1] for c in creates] == ["Role", "Finished", "Peer reviewers"]
+    assert creates[0][creates[0].index("--single-select-options") + 1] == "explorer,debater,implementer,auditor,driver,peer-reviewer"
+    assert creates[1][creates[1].index("--data-type") + 1] == "DATE"
     assert "Peer reviewers" in b.api.project().fields
     b.api.ensure_fields()
-    assert len(gh.argv("gh", "project", "field-create")) == 2
+    assert len(gh.argv("gh", "project", "field-create")) == 3
 
 
-def test_study_and_stage_cards_follow_the_bootstrap_sequence():
-    """R9: parent issue #1, then stage sub-issues #2.. as stages start; closed with Finished and Actual hours."""
+def cards_of(meta, w): return json.loads(meta[f"board:{w.state.thread}"])
+def flat(cards): return [c for st in cards["stages"] for c in st["cards"]]
+
+
+def test_study_and_stage_cards_are_plain_issues_with_one_assignee():
+    """R9/R13: study issue #1, then one plain issue per stage run naming `Study: #1`; closed with Finished, Actual hours, Status Done."""
     w = World(cfg=BCFG)
     b, gh, meta = make()
     w.start()
     b.sync(w.state)
     creates = gh.argv("gh", "issue", "create")
     assert len(creates) == 2 and creates[0][6] == "Study the thing" and creates[1][6].startswith("Explore (iteration 1)")
-    assert creates[0][creates[0].index("--assignee") + 1] == "chengcli"
-    assert gh.sets(board.M_SUB_ISSUE) == [{"parent": "I_1", "child": "I_2"}]
+    assert creates[1][8].startswith("Study: #1\n") and all(c.count("--assignee") == 1 and c[c.index("--assignee") + 1] == "chengcli" for c in creates)
+    assert not any("addSubIssue" in (d or {}).get("query", "") for _, d in gh.calls)
     assert [v["content"] for v in gh.sets(board.M_ADD_ITEM)] == ["I_1", "I_2"]
     dates = {(v["item"], v["field"]): v["date"] for v in gh.sets(board.M_SET_DATE)}
     assert dates[("PVTI_I_1", "F_Started")] == "2023-11-14" and ("PVTI_I_1", "F_Projected_finish") in dates and ("PVTI_I_2", "F_Started") in dates
+    roles = {v["item"]: v["v"] for v in gh.sets(board.M_SET_OPTION) if v["field"] == "F_role"}
+    assert roles == {"PVTI_I_1": "R_driver", "PVTI_I_2": "R_explorer"}
+    status = [(v["item"], v["v"]) for v in gh.sets(board.M_SET_OPTION) if v["field"] == "F_status"]
+    assert status == [("PVTI_I_1", "S_In Progress"), ("PVTI_I_2", "S_In Progress")]  # R14
     w.to_delivered()
     b.sync(w.state)
-    cards = json.loads(meta[f"board:{w.state.thread}"])
-    assert cards["issue"] == 1 and [c["issue"] for c in cards["stages"]] == [2, 3, 4, 5, 6, 7] and all(c["closed"] for c in cards["stages"])
-    titles = [a[6].split(":")[0] for a in gh.argv("gh", "issue", "create")[1:]]
-    assert titles == [f"{s} (iteration 1)" for s in ("Explore", "Claim", "Debate", "Implement", "Audit", "Deliver")]
+    cards = cards_of(meta, w)
+    # Audit: one card per scope: the peer's (scope) and the local auditor's (code).
+    assert cards["issue"] == 1 and [[c["issue"] for c in st["cards"]] for st in cards["stages"]] == [[2], [3], [4], [5], [6, 7], [8]]
+    titles = [a[6] for a in gh.argv("gh", "issue", "create")[1:]]
+    assert [t.split(":")[0] for t in titles] == ["Explore (iteration 1)", "Claim (iteration 1)", "Debate (iteration 1)", "Implement (iteration 1)", "Audit scope (iteration 1)", "Audit code (iteration 1, local auditor)", "Deliver (iteration 1)"]
+    assigned = {int(a[6].split(":")[0].split()[-1].strip("()")) if False else i + 1: a[a.index("--assignee") + 1] for i, a in enumerate(gh.argv("gh", "issue", "create"))}
+    assert assigned[6] == "reviewer" and assigned[7] == "chengcli"  # the peer's card is the peer's; the owner never assigns itself to it
+    roles = {v["item"]: v["v"] for v in gh.sets(board.M_SET_OPTION) if v["field"] == "F_role"}
+    assert roles["PVTI_I_6"] == "R_peer-reviewer" and roles["PVTI_I_7"] == "R_auditor" and roles["PVTI_I_4"] == "R_debater" and roles["PVTI_I_8"] == "R_driver"
     closed = [a[3] for a in gh.argv("gh", "issue", "close")]
-    assert closed == ["2", "3", "4", "5", "6", "7", "1"]
-    finished = [v["item"] for v in gh.sets(board.M_SET_DATE) if v["field"] == "F_Finished"]
-    assert sorted(finished) == sorted(f"PVTI_I_{n}" for n in (1, 2, 3, 4, 5, 6, 7))
+    assert closed == ["2", "3", "4", "5", "7", "8", "1"]  # #6 waits for the reviewer's SIGN-OFF
+    assert not [c for c in flat(cards) if c["issue"] == 6][0]["closed"]
+    done = [v["item"] for v in gh.sets(board.M_SET_OPTION) if v["field"] == "F_status" and v["v"] == "S_Done"]
+    assert done == [f"PVTI_I_{n}" for n in (2, 3, 4, 5, 7, 8, 1)]
     actual = [v["item"] for v in gh.sets(board.M_SET_NUMBER) if v["field"] == "F_Actual_hours"]
-    assert sorted(actual) == sorted(finished)
-    options = [v["v"] for v in gh.sets(board.M_SET_OPTION) if v["item"] == "PVTI_I_1"]
+    assert sorted(actual) == sorted(done)
+    options = [v["v"] for v in gh.sets(board.M_SET_OPTION) if v["item"] == "PVTI_I_1" and v["field"] == "F_stage"]
     assert options[0] == "O_Explore" and options[-1] == "O_Delivered"
     body_edits = [a for a in gh.argv("gh", "issue", "edit") if "--body" in a]
     assert "| Stage | Start | Projected | End | Actual |" in body_edits[-1][body_edits[-1].index("--body") + 1]
     assert any(v["field"] == "F_Peer_reviewers" and v["v"] == "reviewer" for v in gh.sets(board.M_SET_TEXT))
+    # The reviewer signs off after delivery: their card closes with Finished = sign-off day and Status Done.
+    w.now += 7200
+    w.ev("sign_off", sender="UREV", pr="p", sha="s", verdict="approve")
+    b.sync(w.state)
+    assert [a[3] for a in gh.argv("gh", "issue", "close")][-1] == "6" and [c for c in flat(cards_of(meta, w)) if c["issue"] == 6][0]["closed"]
+    assert [v for v in gh.sets(board.M_SET_NUMBER) if v["item"] == "PVTI_I_6" and v["field"] == "F_Actual_hours"][0]["v"] == 2.0
+
+
+def test_peer_card_unassigned_until_login_known_never_the_owner():
+    cfg = dataclasses.replace(BCFG, people={"UOWNER": "chengcli"})  # the reviewer's login is unknown
+    w = World(cfg=cfg)
+    b, gh, meta = make(cfg=cfg)
+    w.to_audit()
+    b.sync(w.state)
+    peer = [a for a in gh.argv("gh", "issue", "create") if a[6].startswith("Audit scope")][0]
+    assert "--assignee" not in peer
+    w.ev("login_reply", sender="UREV", login="late-login")
+    b.sync(w.state)
+    adds = [a for a in gh.argv("gh", "issue", "edit") if "--add-assignee" in a]
+    assert len(adds) == 1 and adds[0][adds[0].index("--add-assignee") + 1] == "late-login"
+
+
+def test_role_totals():
+    w = World()
+    w.to_delivered()
+    w.now += 1800
+    w.ev("sign_off", sender="UREV", pr="p", sha="s", verdict="approve")
+    totals = board.role_totals(w.state)
+    assert set(totals) == {"explorer", "driver", "debater", "implementer", "auditor", "peer-reviewer"}
+    assert totals["explorer"]["projected"] == 0.33 and totals["driver"]["projected"] == round((120 + 600) / 3600, 2)
+    assert totals["peer-reviewer"] == {"projected": 1.5, "actual": 0.5} and totals["auditor"]["projected"] == 1.5
 
 
 def test_existing_issue_is_attached_not_created():
@@ -149,23 +197,22 @@ def test_existing_issue_is_attached_not_created():
     b.issue_numbers = {w.start().thread: 42}
     b.sync(w.state)
     assert [a[6] for a in gh.argv("gh", "issue", "create")] == ["Explore (iteration 1): Study the thing"]
-    assert gh.sets(board.M_ADD_ITEM)[0]["content"] == "I_42" and gh.sets(board.M_SUB_ISSUE) == [{"parent": "I_42", "child": "I_1"}]
+    assert gh.sets(board.M_ADD_ITEM)[0]["content"] == "I_42" and gh.argv("gh", "issue", "create")[0][8].startswith("Study: #42")
     assert json.loads(meta[f"board:{w.state.thread}"])["issue"] == 42
 
 
 def test_board_failure_is_logged_and_retried_next_transition(caplog):
     w = World(cfg=BCFG)
-    gh = FakeGh(fail_on="addSubIssue")
+    gh = FakeGh(fail_on="Explore (iteration 1)")
     b, gh, meta = make(gh)
     w.start()
-    b.sync(w.state)  # the parent card is created, the stage card's sub-issue link fails
+    b.sync(w.state)  # the study card is created, the stage card's `gh issue create` fails
     assert "board update failed" in caplog.text
     cards = json.loads(meta[f"board:{w.state.thread}"])
     assert cards["issue"] == 1 and cards["stages"] == []
     gh.fail_on = None
     b.sync(w.state)
-    cards = json.loads(meta[f"board:{w.state.thread}"])
-    assert [c["issue"] for c in cards["stages"]] == [3]  # a fresh stage issue; #2 is the orphan from the failed attempt
+    assert [c["issue"] for c in flat(json.loads(meta[f"board:{w.state.thread}"]))] == [2]
 
 
 def test_disabled_board_does_nothing():
@@ -179,7 +226,7 @@ def test_stage_table_renders_wall_clock_rows():
     w = World()
     w.to_claim()
     t = board.stage_table(w.state)
-    assert "| Explore | 2023-11-14 22:13 | 0:10 | 2023-11-14 22:13 | 0:00 |" in t and "| Claim |" in t
+    assert "| Explore | 2023-11-14 22:13 | 0:20 | 2023-11-14 22:13 | 0:00 |" in t and "| Claim |" in t
 
 
 @pytest.mark.parametrize("name,kind", list(board.FIELDS.items()))
