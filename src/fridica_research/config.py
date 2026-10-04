@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 DEFAULT_PATH = "~/.config/fridica-research/research.toml"
@@ -81,6 +81,17 @@ class Config:
         return tuple(s for s in self.audit_scopes if s not in taken) or (() if self.reviewers else ("scope",))
     @property
     def state_file(self) -> Path: return Path(os.path.expanduser(self.state_path))
+
+    def to_dict(self) -> dict: return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Config":
+        """Inverse of `to_dict` (the replay corpus stores the config as JSON)."""
+        d = dict(d)
+        d["board"] = Board(**d.get("board", {}))
+        d["reviewers"] = tuple(Reviewer(**r) for r in d.get("reviewers", ()))
+        for k in ("channels", "starters", "audit_scopes"): d[k] = tuple(d.get(k, ()))
+        return cls(**d)
 
 
 def parse(text: str) -> Config:

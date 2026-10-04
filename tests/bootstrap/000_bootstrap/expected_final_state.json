@@ -1,0 +1,213 @@
+{
+ "approaches": [
+  {
+   "slug": "pure-machine-sqlite",
+   "title": "pure step + SQLite snapshot",
+   "why": "the issue's design"
+  },
+  {
+   "slug": "notes-store",
+   "title": "state in fridica thread notes",
+   "why": "one store"
+  },
+  {
+   "slug": "event-sourced-rebuild",
+   "title": "replay the feed",
+   "why": "no local state"
+  }
+ ],
+ "attempt": 1,
+ "audit": {
+  "verdict": "pass"
+ },
+ "audit_scopes": {
+  "api": {
+   "requested": true,
+   "reviewer": "U_C",
+   "signed_at": 1791137366.0,
+   "verdict": "approve"
+  },
+  "numerics": {
+   "requested": true,
+   "reviewer": "U_A",
+   "signed_at": 1791133166.0,
+   "verdict": "approve"
+  },
+  "scope": {
+   "requested": true,
+   "reviewer": "U_B",
+   "signed_at": 1791137366.0,
+   "verdict": "approve"
+  }
+ },
+ "blocked_from": null,
+ "brief": {
+  "brief": "map it",
+  "questions": [
+   "q1"
+  ]
+ },
+ "channel": "C1",
+ "claim": {
+  "slug": "pure-machine-sqlite",
+  "status": "owned",
+  "ts": "1700000000.000101"
+ },
+ "contested": false,
+ "control": "active",
+ "deliverable": {
+  "details": "long details",
+  "next_problem": "next thing",
+  "summary": "delivered"
+ },
+ "excluded": [],
+ "explorer_report": "Explore: control API, events, conventions.\n\n## Approaches\n- pure-machine-sqlite: pure step + SQLite snapshot -- the issue's design\n- notes-store: state in fridica thread notes -- one store\n- event-sourced-rebuild: replay the feed -- no local state\n",
+ "findings": [],
+ "finished_at": 1791137366.0,
+ "followon": "C1:1700000000.000104",
+ "generation": 1,
+ "group": null,
+ "implementer": {
+  "machine_state": {
+   "branch": "study/126-bootstrap",
+   "commit": "deadbeef",
+   "dirty": false
+  },
+  "pr": "https://github.com/chengcli/fridica-research/pull/2",
+  "sha": "deadbeef",
+  "status": "done",
+  "summary": "sum"
+ },
+ "iteration": 1,
+ "lineage": "TJ6E2EJ2K:C0C2D3PCW20:1791125606.982449",
+ "notes": [],
+ "partial": false,
+ "peer_claims": {},
+ "people": {},
+ "phase": "idle",
+ "post_tries": 1,
+ "problem": "Bootstrap: implement fridica-research (fridica #126)",
+ "projected_hours": 4.0,
+ "redacted": false,
+ "reports": {
+  "mathematician": {
+   "report": "concede snapshot store; keep waiting ledger\n\n## Stance\nposition: revised\nnotes: n\n",
+   "stance": "revised",
+   "summary": "sum"
+  },
+  "physicist": {
+   "report": "concede snapshot; hold no log\n\n## Stance\nposition: revised\nnotes: n\n",
+   "stance": "revised",
+   "summary": "sum"
+  }
+ },
+ "round": 2,
+ "signoffs": {
+  "U_A": "approve",
+  "U_B": "approve",
+  "U_C": "approve"
+ },
+ "spawner": true,
+ "stage": "Delivered",
+ "stage_log": [
+  {
+   "actual": 360.0,
+   "end": 1791125966.0,
+   "iteration": 1,
+   "projected": 600,
+   "role": "explorer",
+   "stage": "Explore",
+   "start": 1791125606.0
+  },
+  {
+   "actual": 120.0,
+   "end": 1791126086.0,
+   "iteration": 1,
+   "projected": 120,
+   "role": "driver",
+   "stage": "Claim",
+   "start": 1791125966.0
+  },
+  {
+   "actual": 480.0,
+   "end": 1791126566.0,
+   "iteration": 1,
+   "projected": 1200,
+   "role": "debater",
+   "stage": "Debate",
+   "start": 1791126086.0
+  },
+  {
+   "actual": 5400.0,
+   "end": 1791131966.0,
+   "iteration": 1,
+   "projected": 5400,
+   "role": "implementer",
+   "stage": "Implement",
+   "start": 1791126566.0
+  },
+  {
+   "actual": 5400.0,
+   "end": 1791137366.0,
+   "iteration": 1,
+   "projected": 5400,
+   "role": "auditor",
+   "scopes": {
+    "api": {
+     "requested": true,
+     "reviewer": "U_C",
+     "signed_at": 1791137366.0,
+     "verdict": "approve"
+    },
+    "numerics": {
+     "requested": true,
+     "reviewer": "U_A",
+     "signed_at": 1791133166.0,
+     "verdict": "approve"
+    },
+    "scope": {
+     "requested": true,
+     "reviewer": "U_B",
+     "signed_at": 1791137366.0,
+     "verdict": "approve"
+    }
+   },
+   "stage": "Audit",
+   "start": 1791131966.0
+  },
+  {
+   "actual": 0.0,
+   "end": 1791137366.0,
+   "iteration": 1,
+   "projected": 600,
+   "role": "driver",
+   "stage": "Deliver",
+   "start": 1791137366.0
+  }
+ ],
+ "started_at": 1791125606.0,
+ "synthesis": {
+  "decisions": [
+   "d1"
+  ],
+  "open_questions": [],
+  "synthesis": "do alpha"
+ },
+ "thread": "TJ6E2EJ2K:C0C2D3PCW20:1791125606.982449",
+ "timers": {},
+ "waiting": null,
+ "workers": {
+  "implementer": {
+   "live": false,
+   "worker_id": "w-implementer-6"
+  },
+  "mathematician": {
+   "live": false,
+   "worker_id": "w-mathematician-2"
+  },
+  "physicist": {
+   "live": false,
+   "worker_id": "w-physicist-3"
+  }
+ }
+}
