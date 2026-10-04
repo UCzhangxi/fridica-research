@@ -1,4 +1,4 @@
-"""`fridica-research start | list | stop | resume | serve` (argparse, stdlib only)."""
+"""`fridica-research start | list | stop | resume | serve | replay` (argparse, stdlib only)."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,7 @@ from . import config, contracts
 from .board import Board, role_totals
 from .client import Client, read_capability
 from .driver import Driver, claude_runner
+from .replay import replay
 from .store import Store
 
 
@@ -90,11 +91,22 @@ def parser() -> argparse.ArgumentParser:
     n.add_argument("text")
     v = sub.add_parser("serve", help="run the driver loop")
     v.add_argument("--once", action="store_true", help="one pass over the feed, then exit")
+    r = sub.add_parser("replay", help="fold a replay corpus (or every corpus under a directory) through the machine and compare (R19)")
+    r.add_argument("path", help="a corpus directory or a parent such as tests/bootstrap")
+    r.add_argument("--strict", action="store_true", help="textual differences (D1) fail too")
+    r.add_argument("--accept-added-fields", action="store_true", help="fields the fold adds to actions or state (D3) pass")
     return p
+
+
+def cmd_replay(args) -> int:
+    report = replay(args.path, strict=args.strict, accept_added_fields=args.accept_added_fields)
+    print(report.text())
+    return 0 if report.ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.cmd == "replay": return cmd_replay(args)
     cfg = config.load(args.config)
     if args.cmd == "start": return cmd_start(cfg, args)
     if args.cmd == "list": return cmd_list(cfg, args)

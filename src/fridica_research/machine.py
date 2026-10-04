@@ -302,9 +302,9 @@ class M:
         for r in self.cfg.reviewers:  # one entry per reviewer line, even when two lines name the same reviewer without a scope
             key, n = r.focus or f"review-{r.handle}", 1
             while key in s.audit_scopes: n, key = n + 1, f"{r.focus or f'review-{r.handle}'}-{n + 1}"
-            s.audit_scopes[key] = {"reviewer": r.handle, "verdict": None, "signed_at": None}
+            s.audit_scopes[key] = {"reviewer": r.handle, "verdict": None, "signed_at": None, "requested": True}
         local = self.cfg.uncovered_scopes()
-        for scope in local: s.audit_scopes[scope] = {"reviewer": None, "verdict": None, "signed_at": None}
+        for scope in local: s.audit_scopes[scope] = {"reviewer": None, "verdict": None, "signed_at": None, "requested": True}
         self.mirror_scopes()
         self.arm("timer", self.cfg.stage_timeout)
         if not local:
@@ -443,10 +443,24 @@ class M:
             self.overrun()
 
     def deliver_without_signoffs(self):
+        """The wait ended (stage timer or overrun): only the *missing* sign-offs are waived; a `changes` verdict on the head still returns the study (T1)."""
         s = self.s
+        if self.unrequested(): return  # a scope nobody was asked to review cannot pass (T2); rule R is already running
         s.audit["signoffs_missing"] = [sc["reviewer"] for sc in s.audit_scopes.values() if sc["reviewer"] and sc["signed_at"] is None]
+        if self.return_for_changes(): return
         s.audit.setdefault("verdict", "pass")
         self.enter("Deliver")
+
+    def unrequested(self) -> bool: return any(not sc.get("requested", True) for sc in self.s.audit_scopes.values())
+
+    def return_for_changes(self) -> bool:
+        s = self.s
+        peers = [sc for sc in s.audit_scopes.values() if sc["reviewer"]]
+        if not any(sc["verdict"] == "changes" for sc in peers): return False
+        s.audit["verdict"] = "return"
+        self.cancel_all()
+        self.next_iteration(f"iteration {s.iteration} peer review asked for changes: " + ", ".join(f"{scope}={sc['verdict']}" for scope, sc in sorted(s.audit_scopes.items()) if sc["reviewer"]))
+        return True
 
     def overrun(self):
         """R12: the stage ran 2x its projected time; stop its workers, keep the partial result as a finding, move on."""
@@ -560,14 +574,11 @@ class M:
 
     def check_signoffs(self):
         s = self.s
+        if self.unrequested(): return
         peers = [sc for sc in s.audit_scopes.values() if sc["reviewer"]]
         if self.cfg.require_signoffs and any(sc["signed_at"] is None for sc in peers): return
         s.audit.setdefault("verdict", "pass")
-        if any(sc["verdict"] == "changes" for sc in peers):
-            s.audit["verdict"] = "return"
-            self.cancel_all()
-            self.next_iteration(f"iteration {s.iteration} peer review asked for changes: " + ", ".join(f"{scope}={sc['verdict']}" for scope, sc in sorted(s.audit_scopes.items()) if sc["reviewer"]))
-            return
+        if self.return_for_changes(): return
         self.cancel_all()
         self.enter("Deliver")
 
@@ -598,6 +609,13 @@ class M:
     def post_refused(self, ev: Event):
         s = self.s
         w = s.waiting
+        if s.stage == "Audit" and ev.get("post_kind") == "report" and not (w and w["kind"] == "post") and ev.get("action_id") in (None, self.aid("audit-request")):
+            # T2: the reviewer request never reached the thread; no peer was asked, so the stage cannot pass: record it and apply rule R.
+            for sc in s.audit_scopes.values():
+                if sc["reviewer"]: sc["requested"] = False
+            self.mirror_scopes()
+            self.retry(f"audit request refused: {ev.get('code')}")
+            return
         if not (w and w["kind"] == "post" and ev.get("post_kind") == w["action"]["post_kind"]): return
         code = str(ev.get("code", ""))
         if code.startswith("egress"):
@@ -646,8 +664,9 @@ def head_matches(pr: str, sha: str, reviewed_pr: str, reviewed_sha: str) -> bool
 
 
 def ts_key(ts: str) -> tuple[int, int]:
+    """Slack ts as (seconds, microseconds): the fraction is fixed-width, so `1700.12` (120000 us) sorts after `1700.000012` (12 us)."""
     sec, _, frac = str(ts).partition(".")
-    return int(sec), int(frac or 0)
+    return int(sec), int((frac or "0")[:6].ljust(6, "0"))
 
 
 def start(thread: str, channel: str, problem: str, now: float, *, generation: int = 1, lineage: str = "", spawner: bool = True, projected_hours: float, cfg: Config) -> tuple[State, list[Action]]:

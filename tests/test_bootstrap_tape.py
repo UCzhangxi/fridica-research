@@ -20,12 +20,8 @@ EXPLORE_REPORT = "Explore: control API, events, conventions.\n\n## Approaches\n-
 STAGE_MIN = {"Explore": 6, "Claim": 1, "Debate": 8, "Implement": 90, "Audit": 90, "Deliver": 10}  # from the bootstrap stage log (EDT 10:53 ... )
 
 
-def test_bootstrap_tape():
-    w = World(cfg=BOOTSTRAP, now=1791125606.0)
-    gh = FakeGh()
-    meta = {}
-    b = board.Board(BOOTSTRAP, runner=gh, remember=meta.__setitem__, recall=meta.get)
-    def sync(): b.sync(w.state)
+def tape(w: World, sync=lambda: None):
+    """Drive the bootstrap study's events through `w` (the stage sequence and timings of the real run); `sync` runs where the driver would sync the board."""
     w.start(thread=THREAD, problem="Bootstrap: implement fridica-research (fridica #126)")
     sync()
     w.now += STAGE_MIN["Explore"] * 60
@@ -63,6 +59,14 @@ def test_bootstrap_tape():
     w.ev("sign_off", sender="U_C", pr="https://github.com/chengcli/fridica-research/pull/2", sha="deadbeef", verdict="approve")
     assert w.state.stage == "Delivered"  # deliver LLM call and posts follow at once
     sync()
+
+
+def test_bootstrap_tape():
+    w = World(cfg=BOOTSTRAP, now=1791125606.0)
+    gh = FakeGh()
+    meta = {}
+    b = board.Board(BOOTSTRAP, runner=gh, remember=meta.__setitem__, recall=meta.get)
+    tape(w, lambda: b.sync(w.state))
     # Stage log: one row per stage, in order, each closed, projected from config, actual from the clock.
     assert [r["stage"] for r in w.state.stage_log] == ["Explore", "Claim", "Debate", "Implement", "Audit", "Deliver"]
     assert all(r["end"] is not None and r["actual"] >= 0 for r in w.state.stage_log)

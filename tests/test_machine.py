@@ -6,8 +6,9 @@ import dataclasses
 import pytest
 
 from fridica_research import machine
-from fridica_research.machine import Event
-from support import CFG, EXPLORER_REPORT, PEER, PR, SHA, THREAD, World, report, result
+from fridica_research.config import Reviewer
+from fridica_research.machine import Event, ts_key
+from support import CFG, EXPLORER_REPORT, PEER, PR, REV, SHA, THREAD, World, report, result
 
 
 def test_explore_started_calls_study_brief_then_delegates_explorer():
@@ -347,7 +348,7 @@ def test_audit_scopes_without_local_auditor_and_peer_changes():
     w = World(cfg=cfg)
     w.to_audit()
     assert [a["role"] for a in w.kinds("delegate")] == ["explorer", "mathematician", "physicist", "mathematician", "physicist", "implementer"]
-    assert w.state.phase == "signoff" and w.state.audit_scopes == {"scope": {"reviewer": "UREV", "verdict": None, "signed_at": None}}
+    assert w.state.phase == "signoff" and w.state.audit_scopes == {"scope": {"reviewer": "UREV", "verdict": None, "signed_at": None, "requested": True}}
     w.ev("sign_off", sender="USOMEONE", pr=PR, sha=SHA, verdict="approve")  # not a reviewer: recorded, no effect
     assert w.state.stage == "Audit"
     w.ev("sign_off", sender="UREV", pr=PR, sha=SHA, verdict="changes")
@@ -365,6 +366,38 @@ def test_signoff_for_another_head_is_ignored_and_noted():
     assert len(w.state.findings) == 2 and "sign-off from UREV ignored" in w.state.findings[0] and "pull/10" in w.state.findings[1]
     w.ev("sign_off", sender="UREV", pr="9", sha="abc12", verdict="approve")  # a bare number and a sha prefix name the same head
     assert w.state.stage == "Delivered" and w.state.signoffs == {"UREV": "approve"}
+
+
+def test_changes_verdict_survives_a_timeout_of_the_other_signoff():
+    """T1 (post-merge review): a `changes` on the head returns the study even when another sign-off times out; only missing sign-offs are waived."""
+    cfg = dataclasses.replace(CFG, reviewers=(Reviewer(REV, "scope"), Reviewer("UREV2", "code")), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="changes")
+    assert w.state.stage == "Audit"
+    w.tick(cfg.stage_timeout)
+    assert w.state.iteration == 2 and w.state.audit["verdict"] == "return" and w.state.audit["signoffs_missing"] == ["UREV2"]
+    assert "scope=changes" in w.state.findings[0]
+
+
+def test_refused_audit_request_is_recorded_and_retried():
+    """T2 (post-merge review): a refused reviewer request leaves every peer scope unrequested; the stage cannot pass and rule R re-posts it."""
+    cfg = dataclasses.replace(CFG, reviewers=(Reviewer(REV, "scope"), Reviewer("UREV2", "code")), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    req = [p for p in w.kinds("post") if p["post_kind"] == "report"]
+    w.ev("post_refused", action_id=req[-1].id, post_kind="report", code="rate_limited", outcome="rejected")
+    assert w.state.stage == "Audit" and w.state.attempt == 2 and all(sc["requested"] for sc in w.state.audit_scopes.values())
+    assert len([p for p in w.kinds("post") if p["post_kind"] == "report"]) == 2 and "audit request refused" in w.state.notes[-1]
+    w.ev("post_refused", post_kind="report", code="rate_limited", outcome="rejected")  # second refusal: Blocked, never a pass
+    assert w.state.stage == "Blocked" and not any(sc["requested"] for sc in w.state.audit_scopes.values())
+    w.tick(cfg.stage_timeout)
+    assert w.state.stage == "Blocked" and w.state.audit.get("verdict") is None
+
+
+def test_ts_key_is_fixed_width():
+    assert ts_key("1700.12") > ts_key("1700.000012") and ts_key("1700.000012") == (1700, 12) and ts_key("1700.12") == (1700, 120000)
+    assert ts_key("1700") < ts_key("1700.000001") < ts_key("1701.000000")
 
 
 def test_head_matches_table():

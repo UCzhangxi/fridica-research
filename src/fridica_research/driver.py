@@ -146,7 +146,7 @@ class Driver:
         except ControlError as e:
             log.warning("%s %s failed: %s", a.kind, a.id, e)
             if a.kind == "delegate": return [Event("delegate_refused", now, {"action_id": a.id, "code": e.code, "status": e.status, "role": a["role"]})]
-            if a.kind == "post": return [Event("post_refused", now, {"post_kind": a["post_kind"], "code": e.code, "outcome": "rejected"})]
+            if a.kind == "post": return [Event("post_refused", now, {"action_id": a.id, "post_kind": a["post_kind"], "code": e.code, "outcome": "rejected"})]
         return []
 
     def run_llm(self, action_id: str, name: str, prompt: str) -> Event:

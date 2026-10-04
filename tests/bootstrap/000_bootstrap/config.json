@@ -1,0 +1,70 @@
+{
+ "config": {
+  "audit_scopes": [],
+  "auditor_backend": "other",
+  "auto_followon": true,
+  "board": {
+   "enabled": true,
+   "number": 8,
+   "owner": "chengcli",
+   "owner_type": "user",
+   "repo": "chengcli/fridica-research",
+   "token_env": "GH_TOKEN"
+  },
+  "capability_file": null,
+  "channels": [
+   "C0C2D3PCW20"
+  ],
+  "default_projected_hours": 4.0,
+  "idle_sleep": 2.0,
+  "llm_model": "haiku",
+  "max_debate_rounds": 2,
+  "max_generations": 5,
+  "max_iterations": 3,
+  "owner": "UOWNER",
+  "people": {
+   "UOWNER": "chengcli"
+  },
+  "projection": {
+   "audit": 5400,
+   "claim": 120,
+   "debate": 1200,
+   "deliver": 600,
+   "explore": 600,
+   "implement": 5400
+  },
+  "require_signoffs": true,
+  "reviewers": [
+   {
+    "focus": "numerics",
+    "handle": "U_A",
+    "login": "a"
+   },
+   {
+    "focus": "scope",
+    "handle": "U_B",
+    "login": "b"
+   },
+   {
+    "focus": "api",
+    "handle": "U_C",
+    "login": "c"
+   }
+  ],
+  "settle_window": 60,
+  "socket": "~/.local/state/fridica/control.sock",
+  "stage_timeout": 14400,
+  "starters": [],
+  "state_path": "~/.local/state/fridica-research/state.sqlite3"
+ },
+ "start": {
+  "channel": "C1",
+  "generation": 1,
+  "lineage": "TJ6E2EJ2K:C0C2D3PCW20:1791125606.982449",
+  "now": 1791125606.0,
+  "problem": "Bootstrap: implement fridica-research (fridica #126)",
+  "projected_hours": 4.0,
+  "spawner": true,
+  "thread": "TJ6E2EJ2K:C0C2D3PCW20:1791125606.982449"
+ }
+}

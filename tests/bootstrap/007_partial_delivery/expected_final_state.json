@@ -1,0 +1,201 @@
+{
+ "approaches": [
+  {
+   "slug": "alpha",
+   "title": "Alpha design",
+   "why": "cheapest"
+  },
+  {
+   "slug": "beta",
+   "title": "Beta design",
+   "why": "robust"
+  },
+  {
+   "slug": "gamma",
+   "title": "Gamma design",
+   "why": "exotic"
+  }
+ ],
+ "attempt": 1,
+ "audit": {
+  "report": "analysis\n\n## Stance\nverdict: return\nnotes: n\n",
+  "summary": "sum",
+  "verdict": "return"
+ },
+ "audit_scopes": {
+  "code": {
+   "requested": true,
+   "reviewer": null,
+   "signed_at": null,
+   "verdict": null
+  },
+  "scope": {
+   "requested": true,
+   "reviewer": "UREV",
+   "signed_at": null,
+   "verdict": null
+  }
+ },
+ "blocked_from": null,
+ "brief": {
+  "brief": "map it",
+  "questions": [
+   "q1"
+  ]
+ },
+ "channel": "C1",
+ "claim": {
+  "slug": "alpha",
+  "status": "owned",
+  "ts": "1700000000.000101"
+ },
+ "contested": false,
+ "control": "active",
+ "deliverable": {
+  "details": "long details",
+  "next_problem": "next thing",
+  "summary": "delivered"
+ },
+ "excluded": [],
+ "explorer_report": "Findings...\n\n## Approaches\n- alpha: Alpha design -- cheapest\n- beta: Beta design -- robust\n- gamma: Gamma design -- exotic\n",
+ "findings": [
+  "iteration 1 audit returned: sum"
+ ],
+ "finished_at": 1700000060.0,
+ "followon": "C1:1700000000.000104",
+ "generation": 1,
+ "group": null,
+ "implementer": {
+  "machine_state": {
+   "branch": "b",
+   "commit": "abc1234",
+   "dirty": false
+  },
+  "pr": "https://github.com/o/r/pull/9",
+  "sha": "abc1234",
+  "status": "done",
+  "summary": "sum"
+ },
+ "iteration": 1,
+ "lineage": "T1:C1:1700000000.000100",
+ "notes": [],
+ "partial": true,
+ "peer_claims": {},
+ "people": {},
+ "phase": "idle",
+ "post_tries": 1,
+ "problem": "Study the thing",
+ "projected_hours": 4.0,
+ "redacted": false,
+ "reports": {
+  "mathematician": {
+   "report": "analysis\n\n## Stance\nposition: agree\nnotes: n\n",
+   "stance": "agree",
+   "summary": "sum"
+  },
+  "physicist": {
+   "report": "analysis\n\n## Stance\nposition: agree\nnotes: n\n",
+   "stance": "agree",
+   "summary": "sum"
+  }
+ },
+ "round": 2,
+ "signoffs": {},
+ "spawner": true,
+ "stage": "Delivered",
+ "stage_log": [
+  {
+   "actual": 0.0,
+   "end": 1700000000.0,
+   "iteration": 1,
+   "projected": 1200,
+   "role": "explorer",
+   "stage": "Explore",
+   "start": 1700000000.0
+  },
+  {
+   "actual": 60.0,
+   "end": 1700000060.0,
+   "iteration": 1,
+   "projected": 120,
+   "role": "driver",
+   "stage": "Claim",
+   "start": 1700000000.0
+  },
+  {
+   "actual": 0.0,
+   "end": 1700000060.0,
+   "iteration": 1,
+   "projected": 1200,
+   "role": "debater",
+   "stage": "Debate",
+   "start": 1700000060.0
+  },
+  {
+   "actual": 0.0,
+   "end": 1700000060.0,
+   "iteration": 1,
+   "projected": 5400,
+   "role": "implementer",
+   "stage": "Implement",
+   "start": 1700000060.0
+  },
+  {
+   "actual": 0.0,
+   "end": 1700000060.0,
+   "iteration": 1,
+   "projected": 5400,
+   "role": "auditor",
+   "scopes": {
+    "code": {
+     "requested": true,
+     "reviewer": null,
+     "signed_at": null,
+     "verdict": null
+    },
+    "scope": {
+     "requested": true,
+     "reviewer": "UREV",
+     "signed_at": null,
+     "verdict": null
+    }
+   },
+   "stage": "Audit",
+   "start": 1700000060.0
+  },
+  {
+   "actual": 0.0,
+   "end": 1700000060.0,
+   "iteration": 1,
+   "projected": 600,
+   "role": "driver",
+   "stage": "Deliver",
+   "start": 1700000060.0
+  }
+ ],
+ "started_at": 1700000000.0,
+ "synthesis": {
+  "decisions": [
+   "d1"
+  ],
+  "open_questions": [],
+  "synthesis": "do alpha"
+ },
+ "thread": "T1:C1:1700000000.000100",
+ "timers": {},
+ "waiting": null,
+ "workers": {
+  "implementer": {
+   "live": false,
+   "worker_id": "w-implementer-6"
+  },
+  "mathematician": {
+   "live": false,
+   "worker_id": "w-mathematician-2"
+  },
+  "physicist": {
+   "live": false,
+   "worker_id": "w-physicist-3"
+  }
+ }
+}
