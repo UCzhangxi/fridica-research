@@ -98,6 +98,48 @@ def test_checked_in_corpora_are_redaction_clean():
     assert [replay.leaks(ROOT / n) for n in CORPORA] == [[] for _ in CORPORA]
 
 
+def test_volatile_null_to_set_is_structural(tmp_path):
+    """F1: masking hides the value of a volatile field, not whether it is set."""
+    dst = tmp_path / "unset"
+    shutil.copytree(ROOT / "001_simple_research", dst)
+    d = json.loads((dst / "expected_final_state.json").read_text())
+    assert d["finished_at"] is not None
+    d["finished_at"] = None
+    (dst / "expected_final_state.json").write_text(json.dumps(d, sort_keys=True))
+    r = replay.replay_one(dst)
+    assert r.cls == "D2" and r.first.startswith("state.finished_at")
+
+
+def test_text_type_change_is_structural(tmp_path):
+    """F2: a text key going from a string to null (or back) is D2, not D1."""
+    dst = tmp_path / "typed"
+    shutil.copytree(ROOT / "001_simple_research", dst)
+    rows = [json.loads(line) for line in (dst / "expected_actions.jsonl").read_text().splitlines()]
+    i = next(i for i, a in enumerate(rows) if a["kind"] == "post" and a["details"] is None)
+    rows[i]["details"] = "was a string"
+    (dst / "expected_actions.jsonl").write_text("".join(json.dumps(a) + "\n" for a in rows))
+    r = replay.replay_one(dst)
+    assert r.cls == "D2" and f"actions[{i}].details" in r.first and "type changed" in r.first
+
+
+def test_every_contract_line_is_structural(monkeypatch):
+    """F3: the why/also-considered lines of a claim are parsed by peers, so a change there is D2."""
+    orig = briefs.guard_post
+    monkeypatch.setattr(briefs, "guard_post", lambda text, details: orig(text.replace("why: ", "why: changed "), details))
+    r = replay.replay(ROOT / "001_simple_research")
+    assert r.corpora[0].cls == "D2" and "contract lines differ" in r.corpora[0].first and "why" in r.corpora[0].first
+
+
+def test_classes_are_judged_per_field_never_masked(monkeypatch):
+    """F4: a D3 accepted with --accept-added-fields does not hide a D1 under --strict; the report names every class."""
+    orig = briefs.explorer
+    monkeypatch.setattr(briefs, "explorer", lambda *a, **k: orig(*a, **k) + "\nnote: churn")
+    monkeypatch.setattr(machine.M, "board", lambda self: self.emit("board_update", self.aid("board"), thread=self.s.thread, extra=1))
+    r = replay.replay(ROOT / "001_simple_research", strict=True, accept_added_fields=True)
+    assert r.corpora[0].cls == "D3" and r.corpora[0].classes == ["D3", "D1"] and not r.ok and "D3+D1" in r.text()
+    assert replay.replay(ROOT / "001_simple_research", strict=False, accept_added_fields=True).ok
+
+
 def test_volatile_fields_are_masked(tmp_path):
     dst = tmp_path / "shifted"
     shutil.copytree(ROOT / "001_simple_research", dst)

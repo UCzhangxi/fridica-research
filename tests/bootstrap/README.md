@@ -19,10 +19,13 @@ that script (`World` in `tests/support.py`); never edit them by hand.
 
 ## Comparison
 
-Final state: byte-equal after `json.dumps(sort_keys=True)`. Actions: by position, on
-`pi_struct = (kind, id, non-text data, contract lines of brief/prompt/text/details)` where the
-contract lines are the `ref`, `Stage`, `approach`, `generation`, `lineage`, `projected`,
-claim-head and `SIGN-OFF` lines that peers and the driver parse (`replay.contract_lines`).
+Final state: byte-equal after `json.dumps(sort_keys=True)`. Actions: by position, first on
+`pi_struct = (kind, id, non-text data, contract lines of brief/prompt/text/details)` (`replay.pi_struct`,
+differences are D2 or D3), then on `pi_text` (the brief/prompt/text/details strings, `replay.pi_text`,
+differences are D1; a text that changes type, e.g. string to null, or disappears is D2). The contract
+lines are every `key: value` line `contracts.py` parses (`ref`, `Stage`, `approach`, `why`,
+`also considered`, `generation`, `lineage`, `projected`, `producer`), the claim head and the
+`SIGN-OFF` line (`replay.contract_lines`).
 
 | class | meaning | default | `--strict` | `--accept-added-fields` |
 |---|---|---|---|---|
@@ -32,10 +35,13 @@ claim-head and `SIGN-OFF` lines that peers and the driver parse (`replay.contrac
 | D3 | the fold added keys and nothing else differs | fail | fail | pass |
 | LEAK | a token-like string (`sk-`, `ghp_`, `xoxb-`, `Bearer ...`) in a corpus file | fail | fail | fail |
 
-Checks run D2, then D3, then D1, so a structural change is never masked by an added field or
-by text churn. Volatile fields are masked before every comparison in every mode:
+Classes are evaluated per field; the corpus is named after its worst class (D2 > D3 > D1) and
+passes only when every class present passes on its own, so an accepted D3 never hides a D1
+under `--strict` and a structural change is never masked by an added field or by text churn.
+Volatile fields have their *values* masked before every comparison in every mode:
 `started_at`, `finished_at`, `signed_at`, `start`, `end`, `actual` (wall-clock stamps and the
-durations derived from them, wherever they appear). Everything else, including
+durations derived from them, wherever they appear); a volatile field going null to set, or
+appearing or disappearing, still counts (D2/D3). Everything else, including
 `arm_timer.deadline`, is compared exactly.
 
 ## Churn policy
@@ -48,7 +54,9 @@ durations derived from them, wherever they appear). Everything else, including
   `fridica-research replay tests/bootstrap --accept-added-fields` to prove nothing else moved,
   then regenerates.
 - New behaviour gets a new scenario (next number) rather than a hand-edited tape. Corpora
-  `008_changes_then_timeout` and `009_refused_reviewer` were recorded with the corrected
-  behaviour of the post-merge review (T1, T2) and failed on the revision before the fix.
+  `008_changes_then_timeout`, `009_refused_reviewer` (the request refused twice, never echoed,
+  Blocked) and `010_refused_reviewer_retry` (refused once, re-posted, echoed, approved) were
+  recorded with the corrected behaviour of the post-merge review (T1, T2) and fail on the
+  revision before the fix.
 - Corpora are checked in, so they must be redaction-clean: the `LEAK` check fails any corpus
   containing a token-like string.

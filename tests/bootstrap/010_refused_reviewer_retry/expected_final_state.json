@@ -16,23 +16,25 @@
    "why": "exotic"
   }
  ],
- "attempt": 2,
- "audit": {},
+ "attempt": 1,
+ "audit": {
+  "verdict": "pass"
+ },
  "audit_scopes": {
   "code": {
-   "requested": false,
+   "requested": true,
    "reviewer": "UREV2",
-   "signed_at": null,
-   "verdict": null
+   "signed_at": 1700000060.0,
+   "verdict": "approve"
   },
   "scope": {
-   "requested": false,
+   "requested": true,
    "reviewer": "UREV",
-   "signed_at": null,
-   "verdict": null
+   "signed_at": 1700000060.0,
+   "verdict": "approve"
   }
  },
- "blocked_from": "Audit",
+ "blocked_from": null,
  "brief": {
   "brief": "map it",
   "questions": [
@@ -47,12 +49,16 @@
  },
  "contested": false,
  "control": "active",
- "deliverable": {},
+ "deliverable": {
+  "details": "long details",
+  "next_problem": "next thing",
+  "summary": "delivered"
+ },
  "excluded": [],
  "explorer_report": "Findings...\n\n## Approaches\n- alpha: Alpha design -- cheapest\n- beta: Beta design -- robust\n- gamma: Gamma design -- exotic\n",
  "findings": [],
- "finished_at": null,
- "followon": null,
+ "finished_at": 1700000060.0,
+ "followon": "C1:1700000000.000104",
  "generation": 1,
  "group": null,
  "implementer": {
@@ -69,8 +75,7 @@
  "iteration": 1,
  "lineage": "T1:C1:1700000000.000100",
  "notes": [
-  "retrying Audit: audit request refused: rate_limited",
-  "Audit failed twice (audit request refused: rate_limited); `fridica-research resume T1:C1:1700000000.000100` after fixing it"
+  "retrying Audit: audit request refused: rate_limited"
  ],
  "partial": false,
  "peer_claims": {},
@@ -93,9 +98,12 @@
   }
  },
  "round": 2,
- "signoffs": {},
+ "signoffs": {
+  "UREV": "approve",
+  "UREV2": "approve"
+ },
  "spawner": true,
- "stage": "Blocked",
+ "stage": "Delivered",
  "stage_log": [
   {
    "actual": 0.0,
@@ -141,19 +149,28 @@
    "role": "auditor",
    "scopes": {
     "code": {
-     "requested": false,
+     "requested": true,
      "reviewer": "UREV2",
-     "signed_at": null,
-     "verdict": null
+     "signed_at": 1700000060.0,
+     "verdict": "approve"
     },
     "scope": {
-     "requested": false,
+     "requested": true,
      "reviewer": "UREV",
-     "signed_at": null,
-     "verdict": null
+     "signed_at": 1700000060.0,
+     "verdict": "approve"
     }
    },
    "stage": "Audit",
+   "start": 1700000060.0
+  },
+  {
+   "actual": 0.0,
+   "end": 1700000060.0,
+   "iteration": 1,
+   "projected": 600,
+   "role": "driver",
+   "stage": "Deliver",
    "start": 1700000060.0
   }
  ],

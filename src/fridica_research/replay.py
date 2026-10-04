@@ -23,10 +23,11 @@ from .config import Config
 
 FILES = ("config.json", "events.jsonl", "expected_actions.jsonl", "expected_final_state.json")
 TEXT_KEYS = ("brief", "prompt", "text", "details")
-CONTRACT_KEYS = ("ref", "stage", "approach", "generation", "lineage", "projected")  # `contracts.lines` keys the peers and the driver parse
-VOLATILE = ("started_at", "finished_at", "signed_at", "start", "end", "actual")  # masked everywhere (documented in tests/bootstrap/README.md)
+CONTRACT_KEYS = ("ref", "stage", "approach", "why", "also_considered", "generation", "lineage", "projected", "producer")  # every `contracts.lines` key a peer or the driver parses
+VOLATILE = ("started_at", "finished_at", "signed_at", "start", "end", "actual")  # values masked everywhere, presence and null-ness still compared (tests/bootstrap/README.md)
 TOKEN = re.compile(r"sk-[A-Za-z0-9]|ghp_|xoxb-|xoxp-|Bearer\s+[A-Za-z0-9]")
 PASSES = {"D0": lambda strict, added: True, "D1": lambda strict, added: not strict, "D2": lambda strict, added: False, "D3": lambda strict, added: added, "LEAK": lambda strict, added: False}
+WORST = ("LEAK", "D2", "D3", "D1", "D0")
 
 
 # -- projection -----------------------------------------------------------------
@@ -51,7 +52,8 @@ def pi_text(a: dict) -> dict: return {k: a[k] for k in TEXT_KEYS if k in a}
 
 
 def mask(v):
-    if isinstance(v, dict): return {k: ("<volatile>" if k in VOLATILE else mask(x)) for k, x in v.items()}
+    """Volatile values become a placeholder; a volatile key that is null (or absent) stays distinguishable from one that is set."""
+    if isinstance(v, dict): return {k: ("<volatile>" if k in VOLATILE and x is not None else mask(x)) for k, x in v.items()}
     if isinstance(v, list): return [mask(x) for x in v]
     return v
 
@@ -121,17 +123,28 @@ class Diff:
     detail: str
 
 
-def diff_dicts(where: str, expected: dict, actual: dict, text_keys: tuple[str, ...] = ()) -> list[Diff]:
-    """Key-level comparison: a missing key or another value is D2, an added key is D3, a text key differing only in its non-contract text is D1."""
+def diff_dicts(where: str, expected: dict, actual: dict) -> list[Diff]:
+    """Key-level comparison of structural data: a missing key or another (masked) value is D2, an added key is D3."""
     out = []
     for k in sorted(set(expected) | set(actual)):
         if k not in actual: out.append(Diff("D2", f"{where}.{k}", "missing in the fold"))
         elif k not in expected: out.append(Diff("D3", f"{where}.{k}", f"added by the fold: {canon(actual[k])[:120]}"))
-        elif k in VOLATILE: continue
-        elif k in text_keys:
-            if contract_lines(expected[k]) != contract_lines(actual[k]): out.append(Diff("D2", f"{where}.{k}", f"contract lines differ: {contract_lines(expected[k])} != {contract_lines(actual[k])}"))
-            elif expected[k] != actual[k]: out.append(Diff("D1", f"{where}.{k}", "".join(difflib.unified_diff(str(expected[k]).splitlines(True), str(actual[k]).splitlines(True), "expected", "fold"))))
-        elif canon(expected[k]) != canon(actual[k]): out.append(Diff("D2", f"{where}.{k}", f"{canon(expected[k])[:160]} != {canon(actual[k])[:160]}"))
+        elif canon({k: expected[k]}) != canon({k: actual[k]}): out.append(Diff("D2", f"{where}.{k}", f"{canon(expected[k])[:160]} != {canon(actual[k])[:160]}"))
+    return out
+
+
+def diff_action(where: str, expected: dict, actual: dict) -> list[Diff]:
+    """`pi_struct` first (kind, id, non-text data, contract lines: D2/D3), then `pi_text` (D1; a text that changes type or disappears is D2)."""
+    se, sa = pi_struct(expected), pi_struct(actual)
+    if (se["kind"], se["id"]) != (sa["kind"], sa["id"]): return [Diff("D2", where, f"{se['kind']} {se['id']} != {sa['kind']} {sa['id']}")]
+    out = diff_dicts(f"{where}.data", se["data"], sa["data"])
+    te, ta = pi_text(expected), pi_text(actual)
+    for k in sorted(set(te) | set(ta)):
+        if k not in ta: out.append(Diff("D2", f"{where}.{k}", "missing in the fold"))
+        elif k not in te: out.append(Diff("D3", f"{where}.{k}", "added by the fold"))
+        elif type(te[k]) is not type(ta[k]): out.append(Diff("D2", f"{where}.{k}", f"type changed: {type(te[k]).__name__} != {type(ta[k]).__name__}"))
+        elif se["lines"][k] != sa["lines"][k]: out.append(Diff("D2", f"{where}.{k}", f"contract lines differ: {se['lines'][k]} != {sa['lines'][k]}"))
+        elif te[k] != ta[k]: out.append(Diff("D1", f"{where}.{k}", "".join(difflib.unified_diff(str(te[k]).splitlines(True), str(ta[k]).splitlines(True), "expected", "fold"))))
     return out
 
 
@@ -141,11 +154,7 @@ def compare(expected_actions: list[dict], actions: list[dict], expected_state: d
         n = min(len(expected_actions), len(actions))
         extra = (actions if len(actions) > n else expected_actions)[n]
         diffs.append(Diff("D2", f"actions[{n}]", f"{len(expected_actions)} actions expected, the fold produced {len(actions)}; first unmatched: {extra.get('kind')} {extra.get('id')}"))
-    for i, (e, a) in enumerate(zip(expected_actions, actions)):
-        if (e.get("kind"), e.get("id")) != (a.get("kind"), a.get("id")):
-            diffs.append(Diff("D2", f"actions[{i}]", f"{e.get('kind')} {e.get('id')} != {a.get('kind')} {a.get('id')}"))
-            continue
-        diffs.extend(diff_dicts(f"actions[{i}] {a.get('kind')} {a.get('id')}", e, a, TEXT_KEYS))
+    for i, (e, a) in enumerate(zip(expected_actions, actions)): diffs.extend(diff_action(f"actions[{i}]", e, a))
     diffs.extend(diff_dicts("state", expected_state, state))
     return diffs
 
@@ -154,12 +163,17 @@ def compare(expected_actions: list[dict], actions: list[dict], expected_state: d
 class CorpusReport:
     name: str
     path: str
-    cls: str  # D0 | D1 | D2 | D3 | LEAK
+    cls: str  # the worst class present: LEAK | D2 | D3 | D1 | D0
     first: str = ""
     added: list[str] = field(default_factory=list)
     diffs: list[Diff] = field(default_factory=list)
 
-    def passes(self, strict: bool, accept_added_fields: bool) -> bool: return PASSES[self.cls](strict, accept_added_fields)
+    @property
+    def classes(self) -> list[str]: return [c for c in WORST if c == self.cls or any(d.cls == c for d in self.diffs)]
+
+    def passes(self, strict: bool, accept_added_fields: bool) -> bool:
+        """Every class present must pass on its own: an accepted D3 never hides a D1 under --strict."""
+        return all(PASSES[c](strict, accept_added_fields) for c in self.classes)
 
 
 @dataclass
@@ -175,7 +189,8 @@ class Report:
         rows = []
         for c in self.corpora:
             verdict = "pass" if c.passes(self.strict, self.accept_added_fields) else "FAIL"
-            rows.append(f"{c.name:<28} {c.cls:<4} {verdict}" + (f"  {c.first}" if c.first else "") + (f"  added: {', '.join(c.added)}" if c.added else ""))
+            classes = "+".join(c.classes)
+            rows.append(f"{c.name:<28} {classes:<8} {verdict}" + (f"  {c.first}" if c.first else "") + (f"  added: {', '.join(c.added)}" if c.added else ""))
         if not self.corpora: rows.append("no corpus found")
         rows.append(f"{sum(c.passes(self.strict, self.accept_added_fields) for c in self.corpora)}/{len(self.corpora)} pass" + (" (strict)" if self.strict else "") + (" (added fields accepted)" if self.accept_added_fields else ""))
         return "\n".join(rows)
@@ -191,7 +206,7 @@ def replay_one(dir_: Path) -> CorpusReport:
     diffs = compare(expected_actions, actual, expected_state, state.to_dict())
     if not diffs and canon(expected_state) == canon(state.to_dict()) and [canon(a) for a in expected_actions] == [canon(a) for a in actual]:
         return CorpusReport(dir_.name, str(dir_), "D0")
-    for cls in ("D2", "D3", "D1"):  # a structural change is never masked by an added field or by text churn
+    for cls in ("D2", "D3", "D1"):  # the worst class names the corpus; every class present is kept and judged on its own
         hits = [d for d in diffs if d.cls == cls]
         if hits: return CorpusReport(dir_.name, str(dir_), cls, f"{hits[0].where}: {hits[0].detail.splitlines()[0] if hits[0].detail else ''}", [d.where for d in diffs if d.cls == "D3"], diffs)
     return CorpusReport(dir_.name, str(dir_), "D2", "byte-level difference outside the compared keys", [], diffs)

@@ -42,8 +42,15 @@
 {"deadline": 1700010860.0, "id": "T1:C1:1700000000.000100/g1/i1/Audit/overrun", "kind": "arm_timer"}
 {"details": null, "id": "T1:C1:1700000000.000100/g1/i1/Audit/a2/audit-request", "kind": "post", "post_kind": "report", "text": "Stage: Audit (iteration 1)\npr: https://github.com/o/r/pull/9\nsha: abc1234\nreviewers:\n<@UREV> (scope)\n<@UREV2> (code)\nReply `SIGN-OFF https://github.com/o/r/pull/9 abc1234 approve|changes` or accept/refute/needs contract decision items. No merge without a human.\n<@UREV2> please reply with your GitHub login\nref: T1:C1:1700000000.000100/g1/i1/Audit/a2/audit-request", "thread": "T1:C1:1700000000.000100"}
 {"deadline": 1700001060.0, "id": "T1:C1:1700000000.000100/g1/i1/Audit/a2/timer", "kind": "arm_timer"}
+{"id": "T1:C1:1700000000.000100/g1/i1/Audit/a2/board", "kind": "board_update", "thread": "T1:C1:1700000000.000100"}
+{"id": "T1:C1:1700000000.000100/g1/i1/Audit/a2/board", "kind": "board_update", "thread": "T1:C1:1700000000.000100"}
 {"id": "T1:C1:1700000000.000100/g1/i1/Audit/overrun", "kind": "cancel_timer"}
 {"id": "T1:C1:1700000000.000100/g1/i1/Audit/a2/timer", "kind": "cancel_timer"}
-{"id": "T1:C1:1700000000.000100/g1/i1/Blocked/a2/stop-implementer", "kind": "stop_worker", "worker_id": "w-implementer-6"}
-{"id": "T1:C1:1700000000.000100/g1/i1/Blocked/a2/notify-2", "kind": "notify_owner", "text": "Audit failed twice (audit request refused: rate_limited); `fridica-research resume T1:C1:1700000000.000100` after fixing it"}
-{"id": "T1:C1:1700000000.000100/g1/i1/Blocked/a2/board", "kind": "board_update", "thread": "T1:C1:1700000000.000100"}
+{"id": "T1:C1:1700000000.000100/g1/i1/Deliver/a1/board", "kind": "board_update", "thread": "T1:C1:1700000000.000100"}
+{"id": "T1:C1:1700000000.000100/g1/i1/Deliver/a1/deliver", "kind": "llm_call", "name": "study_deliver", "prompt": "## Task\nWrite the delivery message and propose the follow-on problem (or null). Return JSON per the schema.\n\n## Study\nStudy the thing\n\n## Approach\nalpha: Alpha design\n\n## Synthesis\ndo alpha\n\n## Implementer summary\nsum\n"}
+{"deadline": 1700001060.0, "id": "T1:C1:1700000000.000100/g1/i1/Deliver/a1/timer", "kind": "arm_timer"}
+{"details": "long details", "id": "T1:C1:1700000000.000100/g1/i1/Deliver/a1/result", "kind": "post", "post_kind": "study_result", "text": "Stage: Deliver (iteration 1)\ndelivered\napproach: alpha\npr: https://github.com/o/r/pull/9\nsha: abc1234\naudit: pass\nprojected: 4 h, actual: 0.02 h\n| Stage | Projected | Actual |\n|---|---|---|\n| Explore | 0.33 h | 0.00 h |\n| Claim | 0.03 h | 0.02 h |\n| Debate | 0.33 h | 0.00 h |\n| Implement | 1.50 h | 0.00 h |\n| Audit | 1.50 h | 0.00 h |\n| Deliver | 0.17 h | 0.00 h |\nref: T1:C1:1700000000.000100/g1/i1/Deliver/a1/result", "thread": "T1:C1:1700000000.000100"}
+{"details": null, "id": "T1:C1:1700000000.000100/g1/i1/Deliver/a1/root", "kind": "post", "post_kind": "study_root", "text": "next thing\n\nprojected: 4 h\ngeneration: 2\nlineage: T1:C1:1700000000.000100\nref: T1:C1:1700000000.000100/g1/i1/Deliver/a1/root", "thread": "T1:C1:1700000000.000100"}
+{"id": "T1:C1:1700000000.000100/g1/i1/Deliver/a1/timer", "kind": "cancel_timer"}
+{"id": "T1:C1:1700000000.000100/g1/i1/Deliver/a1/stop-implementer", "kind": "stop_worker", "worker_id": "w-implementer-6"}
+{"id": "T1:C1:1700000000.000100/g1/i1/Delivered/a1/board", "kind": "board_update", "thread": "T1:C1:1700000000.000100"}

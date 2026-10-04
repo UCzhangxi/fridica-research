@@ -117,12 +117,29 @@ def changes_then_timeout():
     return w
 
 
-def refused_reviewer():
-    """T2: the reviewer request post is refused: the scopes are unrequested, rule R re-posts it, then both approve."""
-    w = World(cfg=TWO_PEERS)
-    w.to_audit()
+def refused_request(w: World):
+    """The reviewer request is refused before any echo of it reaches the feed: the peers were never asked."""
     req = [p for p in w.kinds("post") if p["post_kind"] == "report"][-1]
     w.ev("post_refused", action_id=req.id, post_kind="report", code="rate_limited", outcome="rejected")
+
+
+def refused_reviewer():
+    """T2: the reviewer request post is refused twice, never echoed: the scopes stay unrequested and the stage Blocks (rule R), no pass on timeout."""
+    w = World(cfg=TWO_PEERS, hold=("report",))
+    w.to_audit()
+    refused_request(w)
+    refused_request(w)
+    w.tick(w.cfg.stage_timeout)
+    return w
+
+
+def refused_reviewer_retry():
+    """T2: the refused request is re-posted by rule R, the re-post is echoed, then both reviewers approve."""
+    w = World(cfg=TWO_PEERS, hold=("report",))
+    w.to_audit()
+    refused_request(w)
+    req = [p for p in w.kinds("post") if p["post_kind"] == "report"][-1]
+    w.ev("own_post_seen", ts=w.next_ts(), kind="report", text=req["text"])
     sign_both(w)
     return w
 
@@ -130,7 +147,7 @@ def refused_reviewer():
 SCENARIOS = {
     "000_bootstrap": bootstrap, "001_simple_research": simple_research, "002_debate_disagreement": debate_disagreement, "003_auditor_return": auditor_return,
     "004_worker_failure": worker_failure, "005_timeout_retry": timeout_retry, "006_peer_claim_conflict": peer_claim_conflict, "007_partial_delivery": partial_delivery,
-    "008_changes_then_timeout": changes_then_timeout, "009_refused_reviewer": refused_reviewer,
+    "008_changes_then_timeout": changes_then_timeout, "009_refused_reviewer": refused_reviewer, "010_refused_reviewer_retry": refused_reviewer_retry,
 }
 
 
