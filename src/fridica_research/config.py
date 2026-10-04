@@ -42,6 +42,30 @@ class Board:
 
 
 @dataclass(frozen=True)
+class Bootstrap:
+    """`[backend.bootstrap]`: the feed-journal backend (R15). One journal (one study lineage) per `journal_dir`."""
+    journal_dir: str = "~/.local/state/fridica-research/journal"
+    worktrees_dir: str = ""  # default <journal_dir>/worktrees
+    worker: str = "claude"  # claude | codex
+    models: dict[str, str] = field(default_factory=dict)  # role -> model (claude --model / codex --model)
+    efforts: dict[str, str] = field(default_factory=dict)  # role -> effort level (claude --effort)
+    max_budget_usd_per_job: float = 5.0  # claude --max-budget-usd
+    max_cost_usd_per_study: float = 50.0  # ceiling on the sum of total_cost_usd over the journal; a delegate past it is refused
+    subject_repo: str = ""  # git repository the workers check out; empty -> plain directories under worktrees_dir
+    subject_revision: str = "HEAD"  # `git worktree add --detach <worktree> <revision>`
+    workspace: str = "journal"  # the workspace id of journal threads (`<workspace>:<channel>:<root ts>`)
+    permission_mode: str = "bypassPermissions"  # claude --permission-mode for an unattended worker in its worktree
+    roles_dir: str = ""  # `<roles_dir>/<role>.md` is appended to the worker's system prompt when present (R5)
+    retry_backoff: float = 30.0  # seconds before a re-delegate of a seen ActionId starts; doubles per retry, capped at 8x
+
+
+@dataclass(frozen=True)
+class Backend:
+    kind: str = "fridica"  # fridica | bootstrap
+    bootstrap: Bootstrap = field(default_factory=Bootstrap)
+
+
+@dataclass(frozen=True)
 class Config:
     socket: str = "~/.local/state/fridica/control.sock"
     capability_file: str | None = None
@@ -65,6 +89,7 @@ class Config:
     require_signoffs: bool = True
     people: dict[str, str] = field(default_factory=dict)  # Slack user id -> GitHub login
     llm_model: str = "haiku"
+    backend: Backend = field(default_factory=Backend)
 
     @property
     def socket_path(self) -> Path: return Path(os.path.expanduser(self.socket))
@@ -89,6 +114,8 @@ class Config:
         """Inverse of `to_dict` (the replay corpus stores the config as JSON)."""
         d = dict(d)
         d["board"] = Board(**d.get("board", {}))
+        b = dict(d.get("backend") or {})
+        d["backend"] = Backend(str(b.get("kind", "fridica")), Bootstrap(**(b.get("bootstrap") or {})))
         d["reviewers"] = tuple(Reviewer(**r) for r in d.get("reviewers", ()))
         for k in ("channels", "starters", "audit_scopes"): d[k] = tuple(d.get(k, ()))
         return cls(**d)
@@ -117,7 +144,23 @@ def parse(text: str) -> Config:
         board=Board(bool(b.get("enabled", False)), str(b.get("owner", "")), int(b.get("number", 0)), str(b.get("repo", "")), str(b.get("token_env", "GH_TOKEN")), str(b.get("owner_type", "user"))),
         reviewers=reviewers, audit_scopes=scopes, require_signoffs=bool(a.get("require_signoffs", True)),
         people={str(k): str(v) for k, v in raw.get("people", {}).items()}, llm_model=str(raw.get("llm_model", "haiku")),
+        backend=_backend(raw.get("backend", {})),
     )
+
+
+def _backend(b: dict) -> Backend:
+    kind = str(b.get("kind", "fridica"))
+    if kind not in ("fridica", "bootstrap"): raise ValueError(f"[backend] kind must be fridica or bootstrap, not {kind!r}")
+    bs = b.get("bootstrap", {})
+    if str(bs.get("worker", "claude")) not in ("claude", "codex"): raise ValueError("[backend.bootstrap] worker must be claude or codex")
+    d = Bootstrap()
+    return Backend(kind, Bootstrap(
+        journal_dir=str(bs.get("journal_dir", d.journal_dir)), worktrees_dir=str(bs.get("worktrees_dir", "")), worker=str(bs.get("worker", "claude")),
+        models={str(k): str(v) for k, v in bs.get("models", {}).items()}, efforts={str(k): str(v) for k, v in bs.get("efforts", {}).items()},
+        max_budget_usd_per_job=float(bs.get("max_budget_usd_per_job", d.max_budget_usd_per_job)), max_cost_usd_per_study=float(bs.get("max_cost_usd_per_study", d.max_cost_usd_per_study)),
+        subject_repo=str(bs.get("subject_repo", "")), subject_revision=str(bs.get("subject_revision", "HEAD")), workspace=str(bs.get("workspace", d.workspace)),
+        permission_mode=str(bs.get("permission_mode", d.permission_mode)), roles_dir=str(bs.get("roles_dir", "")), retry_backoff=duration(bs.get("retry_backoff"), d.retry_backoff),
+    ))
 
 
 def _reviewer(r) -> Reviewer:
