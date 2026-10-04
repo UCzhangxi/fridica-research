@@ -16,6 +16,17 @@
    "C0C2D3PCW20"
   ],
   "default_projected_hours": 4.0,
+  "github": {
+   "bots": [
+    "copilot",
+    "copilot-pull-request-reviewer",
+    "github-actions"
+   ],
+   "enabled": false,
+   "poll_interval": 120.0,
+   "post_merge_window": 604800.0,
+   "token_env": "GH_TOKEN"
+  },
   "idle_sleep": 2.0,
   "llm_model": "haiku",
   "max_debate_rounds": 2,
@@ -33,6 +44,7 @@
    "explore": 600,
    "implement": 5400
   },
+  "repos": [],
   "require_signoffs": true,
   "reviewers": [
    {

@@ -64,6 +64,14 @@ require_signoffs = true
 [people]                            # Slack user id -> GitHub login
 U0123456 = "chengcli"
 U0AAAAAAA = "alice"
+
+[github]                            # GitHub reviews as the sign-off (opt-in, R21/R23/R24)
+enabled = true
+poll_interval = "2m"
+
+[repos]                             # merge = "driver": the driver squash-merges after a non-bot approval on the head
+"chengcli/fridica-research" = {merge = "driver", reviewers = ["alice", "bob"]}
+"chengcli/fridica" = {merge = "owner"}
 ```
 
 ```sh
@@ -73,6 +81,7 @@ fridica-research list [--board]
 fridica-research stop <workspace:channel:root_ts>
 fridica-research resume <thread>             # after a Blocked study is fixed
 fridica-research note <thread> "R9: ..."     # a mid-stage change: a finding for this iteration, never sent to a running worker
+fridica-research pr <thread> --repo o/r --head b --title T   # open the study's PR (refused without Closes #N, thread, board, milestone)
 ```
 
 Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/delegate`,
@@ -100,7 +109,8 @@ Needs fridica with the #126 external-driver surface (PR B: `POST /threads/<id>/d
 - `contracts.py`: the pinned routes, event shapes and text-line formats (`ref:`, claims, roots, `## Stance`).
 - `briefs.py` + `schemas/`: brief templates and the three LLM JSON schemas, with a size guard.
 - `driver.py`, `client.py`, `store.py`, `board.py`, `config.py`, `cli.py`.
-- [docs/protocol.md](docs/protocol.md): the protocol R1-R14 as the driver runs it.
+- `github.py`: GitHub reviews as the sign-off, PR hygiene, the driver-side merge, post-merge acknowledgement.
+- [docs/protocol.md](docs/protocol.md): the protocol (R1-R14, R19, R21, R23, R24) as the driver runs it.
 
 ## First study
 
@@ -122,7 +132,7 @@ pytest -q
 Tests: the stage table (`test_machine.py`), the physicist's discriminating tests
 (`test_physics.py`: restart equivalence, claim ordering, progress notes, slot refusal, egress-refused
 deliverable), the driver against a fake control server over a Unix socket (`test_driver.py`,
-`fake_control.py`), the board with a fake `gh` (`test_board.py`), config, CLI, contracts, the
+`fake_control.py`), the board with a fake `gh` (`test_board.py`), GitHub sign-off and merge with a fake `gh` (`test_github.py`), config, CLI, contracts, the
 fold-equivalence check (`test_rebuild.py`) and the bootstrap tape.
 
 ## Known limitations
