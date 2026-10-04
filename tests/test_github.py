@@ -458,6 +458,55 @@ def test_post_merge_changes_requested_is_acknowledged_recorded_and_carried():
     assert "github:carry:o/r" not in meta  # carried into the PR that was opened
 
 
+
+def test_round2_b1_a_failed_acknowledgement_is_retried_with_each_effect_once():
+    late = rv(9, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T13:00:00Z", body="- rename foo\n")
+    gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}, "reviews": [late]}))
+    g, _ = make(gh)
+    w = audit_world()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    gh.fail_once(lambda a: "repos/o/r/issues/9/comments" in a)
+    out = poll(g, w)
+    assert not any(k.startswith("post:ack") for k in (i.key for i in out.items)) and "9" not in [i.key for i in out.items]
+    out = poll(g, w)
+    poll(g, w)
+    assert len(gh.api("repos/o/r/issues/9/comments")) == 2  # the failed reply, then the retry; none after
+    assert ("ack-9", "acknowledged, goes into the next PR: post-merge review by reviewer on o/r#9") in out.posts
+    assert sum(f.endswith("post-merge review by reviewer on o/r#9: rename foo") for f in w.state.findings) == 1
+    assert g.carried("o/r") == {"reviewer": ["rename foo"]}
+
+
+def test_round2_b2_an_outsiders_changes_request_does_not_veto_a_configured_approval():
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED"), rv(2, "stranger", "CHANGES_REQUESTED", body="no")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    out = poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[-1][1].endswith(f"after approval by reviewer on {HEAD[:12]}")
+    assert any(f.endswith(f"GitHub review by stranger on o/r#9 at {HEAD[:12]} (CHANGES_REQUESTED) not counted: not a configured reviewer of o/r: no") for f in w.state.findings)
+
+
+def test_round2_f3_a_dismissed_approval_is_taken_back_and_never_counts():
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED"), rv(2, "rev2", "CHANGES_REQUESTED")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    poll(g, w)
+    assert not gh.argv("gh", "pr", "merge")
+    rs = gh.prs[("o/r", "9")]["reviews"]
+    rs[0]["state"] = "DISMISSED"  # GitHub shows a dismissed review with its id, commit and submitted_at unchanged
+    out = poll(g, w)
+    assert ("dismissed-1", f"SIGN-OFF (GitHub review, mirrored) reviewer: DISMISSED on o/r#9 at {HEAD[:12]}") in out.posts and not gh.argv("gh", "pr", "merge")
+    assert w.state.findings[-1].endswith(f"GitHub review by reviewer on o/r#9 at {HEAD[:12]} was dismissed: it no longer counts toward the merge")
+    rs[1]["state"] = "DISMISSED"
+    rs.append(rv(3, "rev2", "APPROVED", at="2026-10-04T11:00:00Z"))
+    out = poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[-1][1].endswith(f"after approval by rev2 on {HEAD[:12]}")  # not by reviewer
+    assert sum("was dismissed" in f for f in w.state.findings) == 2  # each dismissal once
+
+
+def test_round2_f2_post_merge_review_items_are_capped():
+    from fridica_research.github import review_items
+    assert review_items("- " + "x" * 2000 + "\nshort") == ["x" * 500, "short"]
+
 def test_merged_pr_stops_polling_after_the_window():
     gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}}))
     g, _ = make(gh, dataclasses.replace(GCFG, github=GitHubCfg(enabled=True, poll_interval=0, post_merge_window=60)))

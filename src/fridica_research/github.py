@@ -12,9 +12,9 @@ tests answer them with a fake. For the PR of a study in Audit, Deliver or Delive
   repository (not a bot, not the PR's author; others are findings) and on the current head: APPROVED -> `sign_off approve`, CHANGES_REQUESTED ->
   `sign_off changes` (login -> Slack id through `Config.slack_of`), COMMENTED -> a finding without
   verdict; each counted review is mirrored into the study thread as one SIGN-OFF line that the
-  driver never parses back (`contracts.MIRROR_MARK`);
+  driver never parses back (`contracts.MIRROR_MARK`), and once more as DISMISSED (with a finding) if GitHub dismisses it;
 - for a `[repos]` entry with `merge = "driver"` squash-merges an open PR once at least one counted
-  APPROVED verdict is on the current head and no non-bot CHANGES_REQUESTED is (`--match-head-commit`), and
+  APPROVED verdict is on the current head and no counted CHANGES_REQUESTED is (`--match-head-commit`), and
   records the squash sha; for `merge = "owner"` it posts the approved PR once and waits;
 - after the merge, a CHANGES_REQUESTED review gets one reply on the PR and one line in the thread
   ("acknowledged, goes into the next PR"), its items become findings, and the next PR body to that
@@ -72,8 +72,8 @@ def parse_iso(s: str) -> float: return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%
 
 
 def review_items(body: str) -> list[str]:
-    """The items of a review body: its non-empty lines without list markers ("(no text)" for an empty body)."""
-    items = [re.sub(r"^\s*(?:[-*]|\d+[.)])\s+", "", line).strip() for line in (body or "").splitlines()]
+    """The items of a review body: its non-empty lines without list markers, each cut at 500 characters ("(no text)" for an empty body)."""
+    items = [re.sub(r"^\s*(?:[-*]|\d+[.)])\s+", "", line).strip()[:500] for line in (body or "").splitlines()]
     return [i for i in items if i] or ["(no text)"]
 
 
@@ -286,6 +286,9 @@ class GitHub:
         latest = latest_verdicts(rs)
         for r in rs:
             rid, kind, login = r["id"], r["state"], r["login"]
+            if kind == "DISMISSED" and f"post:review-{rid}" in seen and f"dismissed:{rid}" not in seen and r["commit"] == head:
+                # F3: a counted review GitHub now shows as dismissed is taken back in the thread and the study's findings
+                out.items.append(Item(f"dismissed:{rid}", posts=[(f"dismissed-{rid}", contracts.mirror_line(login, kind, pr, head))], events=[Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {head[:12]} was dismissed: it no longer counts toward the merge"})]))
             if rid in seen: continue
             if kind not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED") or self.is_bot(r) or r["commit"] != head or (kind != "COMMENTED" and latest.get(login.lower()) is not r):
                 seen.append(rid)  # bots never count; a review of an older head never becomes current; a superseded verdict is not the login's
@@ -303,19 +306,25 @@ class GitHub:
                 events.append(Event("sign_off", now, {"sender": slack, "pr": pr, "sha": head, "verdict": "approve" if kind == "APPROVED" else "changes"}))
             else:
                 events.append(Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {head[:12]} ({kind}): no Slack id maps to {login}, so no audit card closes on it; map it in [people]"}))
-            if kind == "CHANGES_REQUESTED" and after: events += self.acknowledge(pr, login, r, t, out, now)
+            if kind == "CHANGES_REQUESTED" and after:
+                acked = self.acknowledge(pr, login, r, t, out, now)
+                if acked is None: continue  # B1: the reply failed; the review stays unseen and is acknowledged on the next poll
+                events += acked
             out.items.append(Item(rid, events=events))
 
-    def acknowledge(self, pr: str, login: str, r: dict, t: dict, out: Poll, now: float) -> list[Event]:
-        """R24: a changes-requested review after the merge: one reply on the PR, one thread line, findings, carried into the next PR."""
+    def acknowledge(self, pr: str, login: str, r: dict, t: dict, out: Poll, now: float) -> list[Event] | None:
+        """R24: a changes-requested review after the merge: one reply on the PR, one thread line, findings, carried into the next PR.
+
+        None when the reply failed: nothing else is produced, and the next poll tries the reply again (each effect once)."""
         repo, n = contracts.pr_id(pr)
         rid = r["id"]
         if rid not in t.setdefault("acked", []):
             try:
                 self.comment(pr, f"@{login} {ACK}.")
                 t["acked"].append(rid)
-            except Exception as e:  # noqa: BLE001 - the thread line and the findings still record it
+            except Exception as e:  # noqa: BLE001 - retried on the next poll
                 log.warning("acknowledgement on %s failed: %s", pr, e)
+                return None
         if f"post:ack-{rid}" not in t["seen"]: out.items.append(Item(f"post:ack-{rid}", posts=[(f"ack-{rid}", f"{ACK}: post-merge review by {login} on {repo}#{n}")]))
         items = review_items(r["body"])
         if rid not in t.setdefault("carried", []):
@@ -327,7 +336,7 @@ class GitHub:
 
     def gate(self, pr: str, state: State, v: dict, rs: list[dict], t: dict, out: Poll, now: float):
         """R23/R24 merge: `merge = "driver"` repos only, at least one APPROVED from a configured reviewer (not the author, not a bot)
-        and no CHANGES_REQUESTED from any non-bot, each a login's latest verdict on the current head."""
+        and no CHANGES_REQUESTED from a configured reviewer, each a login's latest verdict on the current head (a DISMISSED one counts as neither)."""
         repo, n = contracts.pr_id(pr)
         if v.get("state") == "MERGED":
             t.setdefault("merged_at", v.get("mergedAt"))
@@ -339,8 +348,8 @@ class GitHub:
             t["done"] = True
             return
         head = v.get("headRefOid", "")
-        on_head = [r for r in latest_verdicts(rs).values() if r["commit"] == head and not self.is_bot(r)]
-        approvers = sorted(r["login"] for r in on_head if r["state"] == "APPROVED" and not self.counts(pr, v, r["login"]))
+        on_head = [r for r in latest_verdicts(rs).values() if r["commit"] == head and not self.is_bot(r) and not self.counts(pr, v, r["login"])]
+        approvers = sorted(r["login"] for r in on_head if r["state"] == "APPROVED")
         if not approvers or any(r["state"] == "CHANGES_REQUESTED" for r in on_head): return
         if self.cfg.repo(repo).merge != "driver":
             if f"post:approved-{head[:12]}" not in t["seen"]: out.items.append(Item(f"post:approved-{head[:12]}", posts=[(f"approved-{head[:12]}", f"{pr} approved on {head[:12]} by {', '.join(approvers)}; {repo} is merged by its owner")]))
