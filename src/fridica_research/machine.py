@@ -655,11 +655,16 @@ class M:
         self.pick()
 
 
+MIN_SHA = 7  # the shortest sha prefix that names a head
+
+
 def head_matches(pr: str, sha: str, reviewed_pr: str, reviewed_sha: str) -> bool:
-    """A sign-off counts only for the reviewed head: the same PR (URL, `#N` or `N`) and a prefix of the same sha; an unknown head cannot be matched and is accepted."""
-    def pr_id(x: str) -> str: return str(x).strip().rstrip("/").rsplit("/", 1)[-1].lstrip("#")
-    pr_ok = not reviewed_pr or pr_id(pr) == pr_id(reviewed_pr)
-    sha_ok = not reviewed_sha or (bool(sha) and reviewed_sha.lower().startswith(str(sha).lower()))
+    """A sign-off counts only for the reviewed head: the same PR (URL, `owner/repo#N`, `#N` or `N`; the repository
+    is compared whenever both names carry one) and the same sha, either side abbreviated to at least 7 hex digits;
+    an unknown head cannot be matched and is accepted."""
+    pr_ok = not reviewed_pr or contracts.same_pr(pr, reviewed_pr)
+    a, b = sorted((str(sha).strip().lower(), str(reviewed_sha).strip().lower()), key=len)
+    sha_ok = not reviewed_sha or (len(a) >= MIN_SHA and b.startswith(a))
     return pr_ok and sha_ok
 
 

@@ -43,10 +43,11 @@ def thread_id(e: dict) -> str | None:
 
 
 class Driver:
-    def __init__(self, cfg: Config, client: Client, store: Store, llm: LlmRunner | None = None, board=None, clock=time.time, sleep=time.sleep):
+    def __init__(self, cfg: Config, client: Client, store: Store, llm: LlmRunner | None = None, board=None, clock=time.time, sleep=time.sleep, github=None):
         self.cfg, self.client, self.store, self.clock, self.sleep = cfg, client, store, clock, sleep
         self.llm = llm or claude_runner(cfg.llm_model)
         self.board = board
+        self.github = github  # github.GitHub when `[github] enabled` (R21, R23, R24); None keeps Slack-only sign-offs
         self.recovered = False
 
     # -- translation --------------------------------------------------------------
@@ -200,6 +201,19 @@ class Driver:
                 else:
                     for ev in self.execute(s, Action("post", w["id"], w["action"])): self.apply(s.thread, ev)
 
+    def poll_github(self):
+        """R21/R24: each study's PR reviews become machine events; mirror and acknowledgement lines go to the thread as `report` posts."""
+        if self.github is None: return
+        for s in self.store.all():
+            try: out = self.github.poll(s, self.clock())
+            except Exception as e:  # noqa: BLE001 - GitHub never stalls a stage; retried on the next poll
+                log.warning("github poll for %s failed: %s", s.thread, e)
+                continue
+            for suffix, text in out.posts:
+                try: self.client.post_message(s.thread, contracts.PostRequest("report", f"{text}\nref: {s.thread}/github/{suffix}"))
+                except ControlError as e: log.warning("github post in %s failed: %s", s.thread, e)
+            for ev in out.events: self.apply(s.thread, ev)
+
     # -- the loop ------------------------------------------------------------------
     def run_once(self) -> tuple[int, bool]:
         """Commands, one page of the feed, due timers. Returns (feed events applied, page reached the ledger's end)."""
@@ -217,6 +231,7 @@ class Driver:
                 n += 1
         self.store.set_cursor(int(page["next"]))
         self.fire_timers()
+        self.poll_github()
         return n, int(page.get("scanned", 0)) < 1000
 
     def serve(self, once: bool = False):

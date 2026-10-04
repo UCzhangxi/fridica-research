@@ -1,4 +1,4 @@
-"""`fridica-research start | list | stop | resume | serve | replay` (argparse, stdlib only)."""
+"""`fridica-research start | list | stop | resume | note | pr | serve | replay` (argparse, stdlib only)."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,7 @@ from . import config, contracts
 from .board import Board, role_totals
 from .client import Client, read_capability
 from .driver import Driver, claude_runner
+from .github import GitHub, PrHygieneError
 from .replay import replay
 from .store import Store
 
@@ -63,8 +64,29 @@ def cmd_serve(cfg: config.Config, args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     store = Store(cfg.state_file)
     board = Board(cfg, remember=store.set_meta, recall=store.get_meta, issue_numbers=_issue_numbers(store)) if cfg.board.enabled else None
-    Driver(cfg, build_client(cfg), store, llm=claude_runner(cfg.llm_model), board=board).serve(once=args.once)
+    github = GitHub(cfg, remember=store.set_meta, recall=store.get_meta) if cfg.github.enabled else None
+    Driver(cfg, build_client(cfg), store, llm=claude_runner(cfg.llm_model), board=board, github=github).serve(once=args.once)
     return 0
+
+
+def cmd_pr(cfg: config.Config, args) -> int:
+    """R23: open a study's PR with `Closes #N`, the thread, the board link and the milestone, or refuse."""
+    store = Store(cfg.state_file)
+    try:
+        s = store.load(args.thread)
+        if s is None:
+            print(f"unknown study {args.thread}", file=sys.stderr)
+            return 1
+        closes = args.closes if args.closes is not None else json.loads(store.get_meta(f"board:{s.thread}") or "{}").get("issue")
+        gh = GitHub(cfg, remember=store.set_meta, recall=store.get_meta)
+        try: url = gh.open_pr(args.repo, args.head, args.base, args.title, gh.next_pr_body(args.repo, args.summary, closes, s.thread, s.generation))
+        except PrHygieneError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(url)
+        return 0
+    finally:
+        store.close()
 
 
 def _issue_numbers(store: Store) -> dict:
@@ -89,6 +111,14 @@ def parser() -> argparse.ArgumentParser:
     n = sub.add_parser("note", help="record a requirement or design change as a finding for the current iteration (never injected into a running worker)")
     n.add_argument("thread")
     n.add_argument("text")
+    pr = sub.add_parser("pr", help="open a study's pull request with Closes #N, the study thread, the board link and the milestone (R23)")
+    pr.add_argument("thread")
+    pr.add_argument("--repo", required=True, help="owner/name")
+    pr.add_argument("--head", required=True)
+    pr.add_argument("--base", default="main")
+    pr.add_argument("--title", required=True)
+    pr.add_argument("--summary", default="")
+    pr.add_argument("--closes", type=int, default=None, help="the issue the PR closes (default: the study card)")
     v = sub.add_parser("serve", help="run the driver loop")
     v.add_argument("--once", action="store_true", help="one pass over the feed, then exit")
     r = sub.add_parser("replay", help="fold a replay corpus (or every corpus under a directory) through the machine and compare (R19)")
@@ -112,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "list": return cmd_list(cfg, args)
     if args.cmd in ("stop", "resume"): return cmd_command(cfg, args, args.cmd)
     if args.cmd == "note": return cmd_command(cfg, args, f"note:{args.text}")
+    if args.cmd == "pr": return cmd_pr(cfg, args)
     return cmd_serve(cfg, args)
 
 

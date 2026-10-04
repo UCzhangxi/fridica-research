@@ -364,7 +364,9 @@ def test_signoff_for_another_head_is_ignored_and_noted():
     w.ev("sign_off", sender="UREV", pr="https://github.com/o/r/pull/10", sha=SHA, verdict="approve")
     assert w.state.stage == "Audit" and w.state.signoffs == {} and w.state.audit_scopes["scope"]["signed_at"] is None
     assert len(w.state.findings) == 2 and "sign-off from UREV ignored" in w.state.findings[0] and "pull/10" in w.state.findings[1]
-    w.ev("sign_off", sender="UREV", pr="9", sha="abc12", verdict="approve")  # a bare number and a sha prefix name the same head
+    w.ev("sign_off", sender="UREV", pr="9", sha="abc12", verdict="approve")  # a prefix shorter than 7 hex digits names no head
+    assert w.state.stage == "Audit" and len(w.state.findings) == 3
+    w.ev("sign_off", sender="UREV", pr="o/r#9", sha="ABC1234", verdict="approve")  # owner/repo#N and the sha in any case name the same head
     assert w.state.stage == "Delivered" and w.state.signoffs == {"UREV": "approve"}
 
 
