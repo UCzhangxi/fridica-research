@@ -205,14 +205,14 @@ class Driver:
         """R21/R24: each study's PR reviews become machine events; mirror and acknowledgement lines go to the thread as `report` posts."""
         if self.github is None: return
         for s in self.store.all():
-            try: out = self.github.poll(s, self.clock())
-            except Exception as e:  # noqa: BLE001 - GitHub never stalls a stage; retried on the next poll
+            try: self.github.poll(s, self.clock(), lambda item, thread=s.thread: self.deliver_github(thread, item))
+            except Exception as e:  # noqa: BLE001 - GitHub never stalls a stage; an undelivered item comes again on the next poll
                 log.warning("github poll for %s failed: %s", s.thread, e)
-                continue
-            for suffix, text in out.posts:
-                try: self.client.post_message(s.thread, contracts.PostRequest("report", f"{text}\nref: {s.thread}/github/{suffix}"))
-                except ControlError as e: log.warning("github post in %s failed: %s", s.thread, e)
-            for ev in out.events: self.apply(s.thread, ev)
+
+    def deliver_github(self, thread: str, item):
+        """One poll item: its posts, then its events; raising leaves it unseen, so the next poll delivers it again."""
+        for suffix, text in item.posts: self.client.post_message(thread, contracts.PostRequest("report", f"{text}\nref: {thread}/github/{suffix}"))
+        for ev in item.events: self.apply(thread, ev)
 
     # -- the loop ------------------------------------------------------------------
     def run_once(self) -> tuple[int, bool]:
