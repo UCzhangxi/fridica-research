@@ -1,0 +1,166 @@
+# The study protocol, as the driver runs it
+
+This is what `fridica-research serve` does for every study. It was written from the owner's
+requirements of the bootstrap run (R1-R12, 2026-10-04) and the design decisions of the bootstrap
+debate (chengcli/fridica#126); the requirements are stated here as behaviour, not as instructions
+to a human. Source of truth for each rule is the code named beside it.
+
+## The loop
+
+```
+root post in a research channel
+  -> Explore   (LLM study_brief -> explorer worker, ephemeral)
+  -> Claim     (post claim; Pending -> Settling(W) -> Owned, or Lost -> re-pick)
+  -> Debate    (mathematician || physicist, rounds; then LLM study_synthesis)
+  -> Implement (implementer, persistent, resumed across iterations)
+  -> Audit     (auditor worker on the other backend + peer sign-offs in the thread)
+  -> Deliver   (LLM study_deliver -> study_result post -> study_root for the follow-on)
+  -> Delivered
+```
+
+`machine.step(state, event, config) -> (state, actions)` is pure; the driver persists the state
+after every step (`store.py`, one SQLite transaction) and executes the actions (`driver.py`).
+Blocked (owner-resumable) and Stopped are the two ways out of the loop. Every outcome of
+executing an action comes back as an event (`delegated`, `delegate_refused`, `llm_result`,
+`post_refused`), so the snapshot in the store is always the fold of `step` over the events
+(`tests/test_rebuild.py`).
+
+## R1. Stage posts in the study thread
+
+Every stage change that produces a message posts it through fridica's `post` route with meta
+`kind` in `study_claim | study_result | study_root | report` and a readable
+`Stage: <name> (iteration N)` first line: the claim, the audit request (PR, SHA, reviewers), the
+delivery (summary, approach, PR, SHA, audit verdict, projected vs actual, stage table), and the
+out-of-scope notice on a rejected audit. Humans and peer bots are @-mentioned only on the root
+post and on the audit request. Every post and every brief carries a `ref: <ActionId>` line,
+`ActionId = <thread>/g<generation>/i<iteration>/<Stage>/a<attempt>/<suffix>`; Slack metadata
+keys are fixed, so correlation goes through text (`contracts.py`).
+
+## R2. Claim protocol
+
+Claim text: `Claim (iteration N): <title>` / `approach: <slug>` / `why: ...` /
+`also considered: ...` with meta kind `study_claim`. The driver's own claim is **pending** until
+it sees its own post come back on the feed (a successful delivery emits no `outbox` event; the
+echo is the only way to learn the Slack `ts`), then **settling** for `settle_window` (default
+60 s), then **owned**. Smallest Slack `ts` per slug owns it; a peer claim with an earlier `ts`
+seen while pending or settling makes the driver re-pick from the explorer's approaches minus the
+slugs it lost and the slugs peers hold; no candidates left blocks the study with a notice. A peer
+claim with an earlier `ts` that arrives after Debate started does not regress the stage: the study
+is marked contested and the owner is told once. Progress notes (`kind=progress`) and human
+replies are never parsed as claims; only `study_claim` metadata from another owner counts.
+`peer_claims` are keyed by slug per thread; the iteration number in the text is informational.
+
+## R3, R9, R10, R11. The tracking board
+
+Opt-in through `[board] enabled, owner, number, repo, token_env` in `research.toml`. The study
+is a real issue in `repo` (`gh issue create`, or the issue given to `start --issue N`), added to
+the project with `addProjectV2ItemById`; each stage run (Explore, Claim, Debate, Implement,
+Audit, Deliver, per iteration) is its own issue, created when the stage starts, added as a
+sub-issue (`addSubIssue`) and as its own project item, closed when the stage ends. Fields, as on
+project 8: Stage (single select: Explore, Claim, Debate, Implement, Audit, Deliver, Delivered,
+Stopped), Iteration, Generation, Projected hours, Actual hours (number), Started, Projected
+finish, Finished (date), Owner, Approach, Workers, Result, Thread, Follow-on, Peer reviewers
+(text; `Reviewers` is reserved). Missing fields are created once with `gh project field-create`.
+Values go through `updateProjectV2ItemFieldValue` with typed GraphQL variables (`$date: Date!`,
+`$v: Float!`), sent to `gh api graphql --input -` as one JSON document (gh's `-F` turns floats
+into strings). `board.Projects` is the client (`discover`, `item_for_issue`, `set_dates`,
+`set_number`, `set_text`, `set_option`, `verify`), cached in the store's `meta` table;
+`fridica-research list --board` reads the cards back with `verify`. The parent card's body is the
+stage-log table `| Stage | Start | Projected | End | Actual |`, rewritten on every transition.
+Internal stages map onto the board as Blocked -> Stopped; the synthesis LLM call is part of
+Debate. Board failures are logged and retried on the next transition; the board never stalls a
+stage and is never a source of truth.
+
+**One-time owner setup for the Roadmap view (R10)**: the API cannot set a Roadmap view's date
+fields. In the project, open the Roadmap view -> Date fields -> Start: `Started`, Target:
+`Projected finish`. GitHub dates are day-granular; sub-day timing lives in the hours fields and
+the stage log.
+
+## R4. Time tracking
+
+The proposer posts the root (`fridica-research start --projected-hours H`, default
+`default_projected_hours`); the root text states `projected: H h`. Each stage has a projected
+duration in `[projection]` (explore=10m, claim=2m, debate=20m, implement=90m, audit=90m,
+deliver=10m). The machine records start, end and actual per stage row in `state.stage_log`; the
+delivery post states projected vs actual for the study and per stage; the board gets Actual
+hours and Finished on delivery.
+
+## R5. Roles and the loop
+
+Roles are fridica's `assets/roles/*.md` catalog (explorer, mathematician, physicist, implementer,
+auditor); this package carries only the stage -> role mapping and the brief templates
+(`briefs.py`). Debate = mathematician || physicist, each report ending with a `## Stance` block
+(`position: agree|disagree|revised`, `notes:`); a missing position counts as `disagree`. Rounds
+count delegations: `round >= max_debate_rounds` is checked before delegating, so
+`max_debate_rounds = 0` goes straight to the synthesis call with no reports. The pair converges
+when both agree or the maximum is reached; the same two worker ids are resumed in every round and
+every iteration (so the persistent worker count stays at 3 of 4), and stopped at synthesis. The
+stance is parsed from text until fridica-core carries a `stance` field (`contracts.parse_stance`
+is the single seam).
+
+## R6. Audit by peers
+
+Entering Audit posts the PR link and exact head SHA (from the implementer's `machine_state` and
+artifacts), @-mentions the `[audit] reviewers` with their focus, states the sign-off line format,
+and delegates the auditor worker (ephemeral, `auditor_backend`, default `other`). Human replies
+containing `SIGN-OFF <pr> <sha> approve|changes` are recorded. With `require_signoffs = true`
+(default) the stage waits after the auditor's `pass` until every configured reviewer has signed
+off; `changes` sends the study to the next iteration; the stage timer ends the wait and delivers
+with the missing sign-offs listed. The auditor's verdict comes from the `## Stance` block
+(`verdict: pass|return|reject`); missing counts as `return`; `reject` posts an out-of-scope notice
+and stops the study. The driver never merges.
+
+## R7. Self-reference
+
+The package's own repository was the bootstrap study: the README links the Slack thread and the
+board card, and `tests/test_bootstrap_tape.py` replays its stage sequence (explore -> claim ->
+debate, two rounds, both revised -> implement -> audit -> deliver) and asserts the stage log and
+the card sequence (#1 parent, #2-#7 stages).
+
+## R8. Assignees and reviewers
+
+Every card is assigned to the owner's GitHub login; the parent card's `Peer reviewers` lists the
+reviewers' logins. `[people]` maps Slack user ids to logins; when a reviewer's login is unknown
+the audit request asks `@user please reply with your GitHub login` and a bare `@login` /
+`github: login` reply from that user is recorded in the study state.
+
+## R12. Workload across roles (documented, not yet implemented)
+
+The owner's later correction asks for a `Role` single-select on each stage card (explorer,
+debater, implementer, auditor, driver, peer-reviewer) with per-role totals in `list --board`, for
+requirement changes that arrive mid-stage to become findings for the next iteration instead of
+being injected into the running worker, for briefs bounded to the stage's own output, and for a
+stage that exceeds 2x its projected time to be interrupted with its partial result as a finding.
+None of this is implemented in this bootstrap; see the README's limitations.
+
+## Failure handling
+
+| regime | behaviour (`machine.py`) |
+|---|---|
+| stage timeout, job failed/interrupted, LLM failure, explorer with no approaches | retry rule R: attempt 2 re-runs the stage (persistent workers resumed); a second failure Blocks the study and notifies the owner; `fridica-research resume <thread>` re-enters the stage |
+| `WorkerResult.status` failed/needs_input, audit `return` | not a failure: findings += the unresolved items, next iteration (or a partial delivery at `max_iterations`) |
+| `delegate` refused for slot pressure (`too_many_workers`) | wait for the next job to finish or be interrupted, re-send the same body; bounded by the stage timer |
+| any other 4xx on `delegate` | rule R at once (the same body cannot succeed) |
+| post rejected by the egress gate | `study_result`: re-post a redacted version (details withheld) and notify the owner; anything else or a second rejection: rule R |
+| post rate-limited/failed | re-post after `retry_after` (default 30 s), up to three tries; never an LLM re-run |
+| thread paused/closed/archived | Blocked until `thread_control` says active and the owner resumes |
+| owner `stop` | Stopped: all live workers stopped, timers cleared; late results are recorded without a transition |
+
+## Follow-on and generations
+
+A delivery posts a `study_root` for the LLM's `next_problem` when `auto_followon` is on, the
+driver's owner posted the lineage's origin root, and `generation < max_generations`. The root
+text carries `generation: N` and `lineage: <origin thread>`, so the cap is on the lineage, not
+per driver; a peer root without a generation line is treated as the last generation and never
+followed. The child thread is a `started` event like any other; the parent learns its id from
+the root echo's `ref:` line.
+
+## Restart
+
+The driver loads the snapshots and, for each study, probes `GET /threads/<id>` for the one
+waiting action by its `ref:` line: a waiting delegate whose jobs exist is adopted (and finished
+jobs applied), a missing one is re-POSTed byte-identically; a waiting post that exists becomes
+`own_post_seen`, a missing one is re-POSTed; an in-flight LLM call is re-run; timers are in the
+snapshot as absolute deadlines. Polling resumes from the stored cursor
+(`GET /events?after=<cursor>&limit=1000`, end of page when `scanned < limit`, idle sleep 2 s);
+a fresh store starts at the ledger's end.
