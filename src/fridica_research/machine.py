@@ -370,11 +370,16 @@ class M:
                 s.findings.append(f"iteration {s.iteration} sign-off from {ev['sender']} ignored: {ev.get('pr')} {ev.get('sha')} is not the reviewed head {s.implementer.get('pr') or 'none'} {s.implementer.get('sha') or 'none'}")
                 return
             s.signoffs[ev["sender"]] = ev["verdict"]
+            reopened = False
             for sc in s.audit_scopes.values():
-                if sc["reviewer"] == ev["sender"] and sc["signed_at"] is None: sc.update(verdict=ev["verdict"], signed_at=ev.now)
+                # before delivery a later verdict on the reviewed head replaces the earlier one: a `changes` after an approval reopens the scope
+                if sc["reviewer"] == ev["sender"] and (sc["signed_at"] is None or (s.stage in ("Audit", "Deliver") and sc["verdict"] != ev["verdict"])):
+                    reopened |= sc["signed_at"] is not None and ev["verdict"] == "changes"
+                    sc.update(verdict=ev["verdict"], signed_at=ev.now)
             self.mirror_scopes()
             self.board()
             if s.stage == "Audit" and s.phase == "signoff": self.check_signoffs()
+            elif s.stage == "Deliver" and reopened: self.return_for_changes()  # the audit no longer passes; not after Delivered (R24 carries it)
             return
         if k == "finding":
             # R12: changes that arrive while a stage runs never reach the running worker; they are findings for this iteration.

@@ -158,7 +158,7 @@ the stage ends as soon as the local auditor passes, or at once when every scope 
 auditor worker; nothing to wait for); late sign-offs still close the peers' cards. The auditor's verdict comes from the `## Stance` block
 (`verdict: pass|return|reject`); missing counts as `return`; `reject` posts an out-of-scope notice
 and stops the study. The driver merges only through R23/R24 (`[github]` on, a `merge = "driver"`
-repository, a non-bot approval on the current head); otherwise merging is the owner's.
+repository, the PR's assigned auditor's approval on the current head); otherwise merging is the owner's.
 
 ## R7. Self-reference
 
@@ -247,20 +247,21 @@ Opt-in through `[github] enabled = true` (`github.py`; with it absent the driver
 R6 describes, Slack lines only). GitHub reviews are polled by the driver directly and never pass
 through the Slack event feed. For the PR the implementer reported (`implementer.pr`) of a
 study in Audit, Deliver or Delivered, the driver polls every `poll_interval` (default 2 min) the
-PR's own fields (`gh pr view <n> -R <owner/repo> --json headRefOid,state,mergedAt,mergeCommit,author,milestone`)
+PR's own fields (`gh pr view <n> -R <owner/repo> --json headRefOid,state,mergedAt,mergeCommit,author,milestone,isDraft`)
 and its reviews from REST (`gh api --paginate repos/<owner>/<repo>/pulls/<n>/reviews`: `id`,
 `user.login`, `user.type`, `state`, `commit_id`, `submitted_at`); `gh pr view --json latestReviews`
 is never used, since gh leaves its review id and commit oid empty. A login's verdict is its
 latest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review (greatest `submitted_at`, then `id`); a
 later `COMMENTED` review does not replace it, and a superseded verdict is never delivered.
 Reviews are requested through REST, never `gh pr edit`: one
-`POST repos/<owner>/<repo>/pulls/<n>/requested_reviewers` per configured reviewer and head (the
-`[repos]` entry's `reviewers`, else the `[audit]` reviewers' logins), never the PR's author and
+`POST repos/<owner>/<repo>/pulls/<n>/requested_reviewers` per head for the PR's assigned auditor (the
+GitHub login of the study's one peer audit reviewer; with none or several, nothing is requested, nothing
+merges, and a finding says so once), never the PR's author and
 never a bot; a login GitHub refuses (HTTP 422, no access) is recorded as a finding once and never
 requested again, any other failure is retried on the next poll. A review counts only when its
 author is not a bot (a `*[bot]` login, `user.type` `Bot`, or `[github] bots`, default `copilot`,
 `copilot-pull-request-reviewer`, `github-actions`), its `commit_id` is the current `headRefOid`
-(a review of an older head is ignored), and its author is a configured reviewer of the repository
+(a review of an older head is ignored), and its author is the PR's assigned auditor
 and not the PR's author: the repository is public, so a review by any other account is recorded
 as a finding (`GitHub review by <login> ... (<STATE>) not counted: <why>`), never mirrored, never
 a sign-off and never an approval for the merge. The reviewer's GitHub login is turned back into the Slack id
@@ -281,7 +282,8 @@ merge`); a dismissed verdict never counts for the merge. Each post
 and each review's events is marked seen (store meta) only after the driver delivered it (posted,
 applied to the machine); one that fails is delivered again on the next poll. The Slack
 `SIGN-OFF` line stays the fallback for reviewers without repository access. The audit verdict is
-pass only when every reviewer's scope is signed off approve on the reviewed head.
+pass only when every reviewer's scope is signed off approve on the reviewed head; a later `changes`
+from that reviewer on the head reopens the scope (in Audit or Deliver the study returns) until a new approval.
 
 A PR is named by its repository and number (`contracts.pr_id`: a URL, `owner/repo#N`, `#N` or
 `N`); two names denote the same PR when the numbers match and, whenever both carry a repository,
@@ -309,11 +311,12 @@ on its first poll, is added to the study's project (`addProjectV2ItemById` with 
 and gets the generation milestone (`gh api -X PATCH repos/<o>/<r>/issues/<n> -F
 milestone=<number>`; milestones R1, R2, ... are created on demand).
 
-The merge exists only for `merge = "driver"`: once the open PR has at least one `APPROVED`
-verdict on the current head from a configured reviewer of the repository (not a bot, not the PR's
-author) and no `CHANGES_REQUESTED` verdict on it from a configured reviewer (any other account's
-review is a finding only), the driver runs
-`gh pr merge <n> -R <o/r> --squash --match-head-commit <head>`, records that it merged, then the squash sha (from the view after the merge, or from the next poll's
+The merge exists only for `merge = "driver"`: once the open, non-draft PR's assigned auditor's latest
+verdict on the current head is `APPROVED` (any other account's review is a finding only; a draft is
+noted once per head and never merged; GitHub's branch protection on main enforces the required
+approval, stale-approval dismissal and CI), the driver runs
+`gh pr merge <n> -R <o/r> --squash --match-head-commit <head>`, records that it merged, then the squash sha (from the view after the merge,
+also when the merge command errored but the PR is merged at that head, or from the next poll's
 when that view fails) as the generation's revision (store meta `github:revision:<repo>:g<generation>`), and posts
 `merged <repo>#<n> (squash) as <sha> after approval by <logins> on <head>` in the thread. For an
 `owner` repository the driver posts the approved PR once per head and waits; the owner merges.
@@ -322,9 +325,8 @@ other reviewers when its PR merges, and their reviews keep closing their cards.
 
 ## R24. Merge rule and late reviews
 
-Every configured reviewer is requested on a PR; the merge gate is at least one approval from a
-configured reviewer of the repository on the current head (bots such as copilot, the PR's author
-and accounts not in `[repos]` / `[audit]` reviewers never count). A merged PR stays polled
+Only the PR's assigned auditor is requested on a PR; the merge gate is that auditor's approval on the
+current head (bots such as copilot, the PR's author and every other account never count). A merged PR stays polled
 for `post_merge_window` (default 7 days) after `mergedAt`. A `CHANGES_REQUESTED` review by a configured
 reviewer submitted after the merge is acknowledged automatically (once: the reply, the carry and the
 thread line are each recorded as done; a review is marked seen only once the reply succeeded, so a
@@ -333,7 +335,8 @@ into the next PR.`), one line in the study thread (`acknowledged, goes into the 
 review by <login> on <repo>#<n>`), one finding per item of the review body (each item cut at 500 characters)
 (`post-merge review by <login> on <repo>#<n>: <item>`), and the items are carried (store meta
 `github:carry:<repo>`) into the next PR body to that repository under
-`## From post-merge review by <login>`, cleared once that PR is opened. The reviewer's audit
+`## From post-merge review by <login>`; an item leaves the carry once a PR opened with it in its body,
+so an item added after that body was prepared goes into the following PR. The reviewer's audit
 card closes on their review whichever side of the merge it lands.
 
 ## R25. Handover ledger

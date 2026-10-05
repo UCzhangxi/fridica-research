@@ -46,7 +46,7 @@ class FakeGh:
     `gh pr view` answers only the requested `--json` fields, `latestReviews` in its real shape (empty id and oid)."""
 
     def __init__(self, *prs: tuple[str, dict]):
-        self.prs = {contracts.pr_id(url): {"reviews": [], "headRefOid": HEAD, "state": "OPEN", "mergedAt": None, "mergeCommit": None, "author": {"login": "implementer"}, "milestone": None, **v} for url, v in prs}
+        self.prs = {contracts.pr_id(url): {"reviews": [], "headRefOid": HEAD, "state": "OPEN", "mergedAt": None, "mergeCommit": None, "author": {"login": "implementer"}, "milestone": None, "isDraft": False, **v} for url, v in prs}
         self.calls: list[tuple[list[str], dict | None]] = []
         self.milestones: dict[str, list[dict]] = {}
         self.opened: dict[str, str] = {}  # head branch -> PR url
@@ -67,6 +67,7 @@ class FakeGh:
             full = {**pr, "latestReviews": [latest_review(r) for r in pr["reviews"]], "reviewDecision": "APPROVED" if any(r["state"] == "APPROVED" for r in pr["reviews"]) else ""}
             return json.dumps({k: full[k] for k in argv[argv.index("--json") + 1].split(",")})
         if argv[:3] == ["gh", "pr", "merge"]:
+            if self.prs[(argv[argv.index("-R") + 1], argv[3])]["isDraft"]: raise RuntimeError("gh pr merge failed: Pull request #9 is still a draft")
             self.prs[(argv[argv.index("-R") + 1], argv[3])].update(state="MERGED", mergedAt=MERGED_AT, mergeCommit={"oid": SQUASH})
             return ""
         if argv[:3] == ["gh", "pr", "create"]:
@@ -178,7 +179,7 @@ def test_merge_only_for_driver_repos_and_only_without_changes_on_the_head():
     g, _ = make(gh, unlisted)
     poll(g, audit_world(unlisted))
     assert not gh.argv("gh", "pr", "merge")
-    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED"), rv(2, "rev2", "CHANGES_REQUESTED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED"), rv(2, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T11:00:00Z")]}))
     g, _ = make(gh)
     poll(g, audit_world())
     assert not gh.argv("gh", "pr", "merge")
@@ -211,11 +212,11 @@ def test_one_mirror_line_per_review_never_parsed_back():
     g, _ = make(gh)
     w = audit_world()
     first = poll(g, w)
-    gh.prs[("o/r", "9")]["reviews"].append(rv(2, "rev2", "APPROVED"))
+    gh.prs[("o/r", "9")]["reviews"].append(rv(2, "reviewer", "APPROVED", at="2026-10-04T11:00:00Z"))
     second = poll(g, w)
     third = poll(g, w)
     lines = [t for _, t in first.posts + second.posts + third.posts if t.startswith("SIGN-OFF")]
-    assert lines == [f"SIGN-OFF {contracts.MIRROR_MARK} reviewer: COMMENTED on o/r#9 at {HEAD[:12]}", f"SIGN-OFF {contracts.MIRROR_MARK} rev2: APPROVED on o/r#9 at {HEAD[:12]}"]
+    assert lines == [f"SIGN-OFF {contracts.MIRROR_MARK} reviewer: COMMENTED on o/r#9 at {HEAD[:12]}", f"SIGN-OFF {contracts.MIRROR_MARK} reviewer: APPROVED on o/r#9 at {HEAD[:12]}"]
     for line in lines:
         assert contracts.parse_signoff(line) is None and "sign_off" not in replay.contract_lines(line)
     assert contracts.parse_signoff(f"SIGN-OFF {contracts.MIRROR_MARK} x\nSIGN-OFF {PR} {SHA} approve") is None  # the whole mirror post is never a sign-off
@@ -298,13 +299,13 @@ def test_b1_latest_review_per_login_is_the_greatest_submitted_at_then_id():
     assert [e.data["verdict"] for e in out.events if e.kind == "sign_off"] == ["approve"] and len(gh.argv("gh", "pr", "merge")) == 1  # a later COMMENTED keeps the approval
 
 
-def test_b2_only_configured_reviewers_count_never_an_outsider_or_the_author():
+def test_b2_only_the_assigned_auditor_counts_never_an_outsider_or_the_author():
     gh = FakeGh((PR, {"author": {"login": "rev2"}, "reviews": [rv(1, "stranger", "APPROVED", body="lgtm"), rv(2, "rev2", "APPROVED")]}))
     g, _ = make(gh)
     w = audit_world()
     out = poll(g, w)
     assert not gh.argv("gh", "pr", "merge") and [e.kind for e in out.events] == ["finding", "finding"] and out.posts == []
-    assert w.state.findings[-2].endswith(f"GitHub review by stranger on o/r#9 at {HEAD[:12]} (APPROVED) not counted: not a configured reviewer of o/r: lgtm")
+    assert w.state.findings[-2].endswith(f"GitHub review by stranger on o/r#9 at {HEAD[:12]} (APPROVED) not counted: not the assigned auditor of o/r#9: lgtm")
     assert f"GitHub review by rev2 on o/r#9 at {HEAD[:12]} (APPROVED) not counted: the PR's author" in w.state.findings[-1]
     assert w.state.audit_scopes["scope"]["signed_at"] is None and w.state.stage == "Audit"
     gh.prs[("o/r", "9")]["reviews"].append(rv(3, "reviewer", "APPROVED"))
@@ -386,13 +387,27 @@ def test_b4_open_pr_resumes_after_a_failed_step_without_a_second_pr():
     assert [d["variables"]["content"] for a, d in gh.calls if d and d.get("query") == board.M_ADD_ITEM] == ["PR_r_9"] and len(gh.argv("gh", "api", "-X", "PATCH")) == 2
 
 
-def test_l1_an_approver_without_slack_mapping_is_recorded_while_the_merge_proceeds():
-    gh = FakeGh((PR, {"reviews": [rv(1, "rev2", "APPROVED")]}))
-    g, _ = make(gh)
+def test_round4_1_only_the_assigned_auditor_is_requested_and_merges():
+    """#27: the PR's one assigned auditor (the study's peer audit reviewer) is its only reviewer; a configured reviewer's approval is a finding."""
+    gh = FakeGh((PR, {"reviews": [rv(1, "rev2", "APPROVED", body="lgtm")]}))
+    g, meta = make(gh)
     w = audit_world()
     out = poll(g, w)
-    assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[0][1] == f"SIGN-OFF {contracts.MIRROR_MARK} rev2: APPROVED on o/r#9 at {HEAD[:12]}"
-    assert f"GitHub review by rev2 on o/r#9 at {HEAD[:12]} (APPROVED): no Slack id maps to rev2" in w.state.findings[-1]
+    assert [d["reviewers"] for a, d in gh.api("repos/o/r/pulls/9/requested_reviewers")] == [["reviewer"]]  # never rev2
+    assert not gh.argv("gh", "pr", "merge") and out.posts == [] and [e.kind for e in out.events] == ["finding"]
+    assert w.state.findings[-1].endswith(f"GitHub review by rev2 on o/r#9 at {HEAD[:12]} (APPROVED) not counted: not the assigned auditor of o/r#9: lgtm")
+    assert w.state.audit_scopes["scope"]["signed_at"] is None and w.state.stage == "Audit"
+    gh.prs[("o/r", "9")]["reviews"].append(rv(2, "reviewer", "APPROVED", at="2026-10-04T11:00:00Z"))
+    out = poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[-1][1] == f"merged o/r#9 (squash) as {SQUASH} after approval by reviewer on {HEAD[:12]}"
+    two = dataclasses.replace(GCFG, reviewers=(Reviewer(REV, "scope", "reviewer"), Reviewer("UREV2", "code", "rev2")), audit_scopes=("scope", "code"))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))  # two peer reviewers: no single assigned auditor, no request, no merge
+    g, _ = make(gh, two)
+    w = audit_world(two)
+    poll(g, w)
+    poll(g, w)
+    assert not gh.api("repos/o/r/pulls/9/requested_reviewers") and not gh.argv("gh", "pr", "merge")
+    assert sum("has no single assigned auditor" in f for f in w.state.findings) == 1
 
 
 def test_l2_a_merge_whose_follow_up_view_fails_is_still_recorded():
@@ -418,20 +433,27 @@ def test_l3_study_board_and_milestone_on_one_line():
 
 def test_l4_a_reviewer_github_refuses_is_requested_once_and_recorded():
     gh = FakeGh((PR, {}))
-    gh.refuse = {"rev2"}
+    gh.refuse = {"reviewer"}
     g, _ = make(gh)
     w = audit_world()
     poll(g, w)
     poll(g, w)
     reqs = lambda: [d["reviewers"] for a, d in gh.api("repos/o/r/pulls/9/requested_reviewers")]  # noqa: E731
-    assert reqs() == [["reviewer"], ["rev2"]]
-    assert sum("GitHub refused the review request for rev2 on o/r#9" in f for f in w.state.findings) == 1
-    gh.prs[("o/r", "9")]["headRefOid"] = OLD  # a new head: requested again, a transient failure retried, the refused login not
+    assert reqs() == [["reviewer"]]
+    assert sum("GitHub refused the review request for reviewer on o/r#9" in f for f in w.state.findings) == 1
+    gh.prs[("o/r", "9")]["headRefOid"] = OLD  # a new head: the refused login is not requested again
+    poll(g, w)
+    assert reqs() == [["reviewer"]]
+    gh = FakeGh((PR, {}))
+    g, _ = make(gh)
+    w = audit_world()
+    poll(g, w)
+    gh.prs[("o/r", "9")]["headRefOid"] = OLD  # a new head: requested again, a transient failure retried
     gh.fail_once(lambda a: "repos/o/r/pulls/9/requested_reviewers" in a)
     poll(g, w)
     poll(g, w)
     poll(g, w)
-    assert reqs() == [["reviewer"], ["rev2"], ["reviewer"], ["reviewer"]]
+    assert reqs() == [["reviewer"], ["reviewer"], ["reviewer"]]
 
 
 # -- R24: late reviews -------------------------------------------------------------------
@@ -482,25 +504,27 @@ def test_round2_b2_an_outsiders_changes_request_does_not_veto_a_configured_appro
     w = audit_world()
     out = poll(g, w)
     assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[-1][1].endswith(f"after approval by reviewer on {HEAD[:12]}")
-    assert any(f.endswith(f"GitHub review by stranger on o/r#9 at {HEAD[:12]} (CHANGES_REQUESTED) not counted: not a configured reviewer of o/r: no") for f in w.state.findings)
+    assert any(f.endswith(f"GitHub review by stranger on o/r#9 at {HEAD[:12]} (CHANGES_REQUESTED) not counted: not the assigned auditor of o/r#9: no") for f in w.state.findings)
 
 
 def test_round2_f3_a_dismissed_approval_is_taken_back_and_never_counts():
-    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED"), rv(2, "rev2", "CHANGES_REQUESTED")]}))
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
     g, _ = make(gh)
     w = audit_world()
+    gh.fail_once(lambda a: a[:3] == ["gh", "pr", "merge"])  # the first merge fails; the PR stays open
     poll(g, w)
-    assert not gh.argv("gh", "pr", "merge")
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and gh.prs[("o/r", "9")]["state"] == "OPEN"
     rs = gh.prs[("o/r", "9")]["reviews"]
     rs[0]["state"] = "DISMISSED"  # GitHub shows a dismissed review with its id, commit and submitted_at unchanged
     out = poll(g, w)
-    assert ("dismissed-1", f"SIGN-OFF (GitHub review, mirrored) reviewer: DISMISSED on o/r#9 at {HEAD[:12]}") in out.posts and not gh.argv("gh", "pr", "merge")
+    assert ("dismissed-1", f"SIGN-OFF (GitHub review, mirrored) reviewer: DISMISSED on o/r#9 at {HEAD[:12]}") in out.posts and len(gh.argv("gh", "pr", "merge")) == 1
     assert w.state.findings[-1].endswith(f"GitHub review by reviewer on o/r#9 at {HEAD[:12]} was dismissed: it no longer counts toward the merge")
-    rs[1]["state"] = "DISMISSED"
-    rs.append(rv(3, "rev2", "APPROVED", at="2026-10-04T11:00:00Z"))
+    poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1  # a dismissed verdict never merges
+    rs.append(rv(3, "reviewer", "APPROVED", at="2026-10-04T11:00:00Z"))
     out = poll(g, w)
-    assert len(gh.argv("gh", "pr", "merge")) == 1 and out.posts[-1][1].endswith(f"after approval by rev2 on {HEAD[:12]}")  # not by reviewer
-    assert sum("was dismissed" in f for f in w.state.findings) == 2  # each dismissal once
+    assert len(gh.argv("gh", "pr", "merge")) == 2 and out.posts[-1][1].endswith(f"after approval by reviewer on {HEAD[:12]}")
+    assert sum("was dismissed" in f for f in w.state.findings) == 1  # the dismissal once
 
 
 def test_round2_f2_post_merge_review_items_are_capped():
@@ -631,3 +655,52 @@ def test_github_and_repos_config():
     assert config.Config.from_dict(json.loads(json.dumps(c.to_dict()))) == c
     assert not config.parse("").github.enabled and config.parse("").repos == ()
     with pytest.raises(ValueError, match="merge"): config.parse('[repos]\n"o/r" = {merge = "anyone"}\n')
+
+
+# -- round 4 of review ------------------------------------------------------------------------
+def test_round4_3_a_late_item_added_after_the_body_was_prepared_stays_carried_to_the_next_pr():
+    gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}, "reviews": [rv(9, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T13:00:00Z", body="- rename foo\n")]}))
+    g, meta = make(gh)
+    w = audit_world()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    poll(g, w)
+    body = g.next_pr_body("o/r", "Next change.", 21, w.state.thread, 2)
+    gh.prs[("o/r", "9")]["reviews"].append(rv(10, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T14:00:00Z", body="- add a test for bar\n"))
+    poll(g, w)  # the second late review lands after `body` was prepared
+    assert g.carried("o/r") == {"reviewer": ["rename foo", "add a test for bar"]}
+    g.open_pr("o/r", "next", "main", "Next", body)
+    assert g.carried("o/r") == {"reviewer": ["add a test for bar"]}  # only what the opened PR's body lists leaves the carry
+    g.open_pr("o/r", "next", "main", "Next", g.next_pr_body("o/r", "Retry.", 21, w.state.thread, 2))  # a retry for the same PR clears nothing more
+    assert g.carried("o/r") == {"reviewer": ["add a test for bar"]}
+    body2 = g.next_pr_body("o/r", "After.", 21, w.state.thread, 2)
+    assert "- add a test for bar" in body2 and "rename foo" not in body2
+    g.open_pr("o/r", "after", "main", "After", body2)
+    assert "github:carry:o/r" not in meta  # each item written into exactly one PR body
+
+
+def test_round4_4_a_draft_pr_is_never_merged_and_noted_once_per_head():
+    gh = FakeGh((PR, {"isDraft": True, "reviews": [rv(1, "reviewer", "APPROVED")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    for _ in range(3): poll(g, w)
+    assert not gh.argv("gh", "pr", "merge")
+    assert sum(f.endswith(f"o/r#9 is approved on {HEAD[:12]} but is a draft: the driver merges it once it is marked ready for review") for f in w.state.findings) == 1
+    assert all("isDraft" in a[a.index("--json") + 1] for a in gh.argv("gh", "pr", "view"))
+    gh.prs[("o/r", "9")]["isDraft"] = False  # marked ready for review
+    poll(g, w)
+    assert gh.argv("gh", "pr", "merge") == [["gh", "pr", "merge", "9", "-R", "o/r", "--squash", "--match-head-commit", HEAD]]
+
+
+def test_round4_5_a_merge_that_errors_after_github_merged_records_the_squash_sha():
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
+
+    def run(argv, stdin):
+        out = gh(argv, stdin)
+        if argv[:3] == ["gh", "pr", "merge"]: raise RuntimeError("gh pr merge failed: HTTP 502 (the merge went through)")
+        return out
+    g, meta = make(run)
+    w = audit_world()
+    out = poll(g, w)
+    assert len(gh.argv("gh", "pr", "merge")) == 1 and meta["github:revision:o/r:g1"] == SQUASH
+    assert out.posts[-1] == (f"merged-{HEAD[:12]}", f"merged o/r#9 (squash) as {SQUASH} after approval by reviewer on {HEAD[:12]}")
+    assert poll(g, w).posts == [] and len(gh.argv("gh", "pr", "merge")) == 1  # once

@@ -4,17 +4,17 @@ Enabled by `[github] enabled = true`; with it absent the driver behaves as befor
 lines only, no merge). Every gh call goes through one `Runner` (board.py's), so the
 tests answer them with a fake. For the PR of a study in Audit, Deliver or Delivered, `poll`:
 
-- requests every configured reviewer once per head through REST, one login per call
+- requests the PR's assigned auditor (the study's one peer audit reviewer, #27) once per head through REST
   (`POST repos/<o>/<r>/pulls/<n>/requested_reviewers`), never the PR author and never a bot; a 422 is a finding, never retried;
 - reads the PR's fields with `gh pr view --json headRefOid,...` and its reviews from REST
   (`gh api --paginate repos/<o>/<r>/pulls/<n>/reviews`, whose `commit_id` binds a review to a head; gh's
-  `latestReviews` leaves the oid empty); a review counts only when it is by a configured reviewer of the
-  repository (not a bot, not the PR's author; others are findings) and on the current head: APPROVED -> `sign_off approve`, CHANGES_REQUESTED ->
+  `latestReviews` leaves the oid empty); a review counts only when it is by the PR's assigned auditor
+  (not a bot, not the PR's author; others are findings) and on the current head: APPROVED -> `sign_off approve`, CHANGES_REQUESTED ->
   `sign_off changes` (login -> Slack id through `Config.slack_of`), COMMENTED -> a finding without
   verdict; each counted review is mirrored into the study thread as one SIGN-OFF line that the
   driver never parses back (`contracts.MIRROR_MARK`), and once more as DISMISSED (with a finding) if GitHub dismisses it;
-- for a `[repos]` entry with `merge = "driver"` squash-merges an open PR once at least one counted
-  APPROVED verdict is on the current head and no counted CHANGES_REQUESTED is (`--match-head-commit`), and
+- for a `[repos]` entry with `merge = "driver"` squash-merges an open, non-draft PR once the assigned auditor's
+  verdict on the current head is APPROVED (`--match-head-commit`; GitHub's branch protection enforces the rest), and
   records the squash sha; for `merge = "owner"` it posts the approved PR once and waits;
 - after the merge, a CHANGES_REQUESTED review gets one reply on the PR and one line in the thread
   ("acknowledged, goes into the next PR"), its items become findings, and the next PR body to that
@@ -38,7 +38,7 @@ from .config import Config
 from .machine import Event, State
 
 log = logging.getLogger("fridica_research.github")
-PR_FIELDS = "headRefOid,state,mergedAt,mergeCommit,author,milestone"  # the PR's own fields; reviews come from REST (`reviews`)
+PR_FIELDS = "headRefOid,state,mergedAt,mergeCommit,author,milestone,isDraft"  # the PR's own fields; reviews come from REST (`reviews`)
 POLLED_STAGES = ("Audit", "Deliver", "Delivered")
 VERDICTS = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")  # a COMMENTED review never supersedes a login's verdict
 Q_PR = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id}}}"
@@ -197,9 +197,15 @@ class GitHub:
         p = json.loads(self.recall(key) or "{}")
         save = lambda: self.remember(key, json.dumps(p, sort_keys=True))  # noqa: E731
         if not p.get("url"):
-            p["url"] = self.existing_pr(repo, head) or self.run(["gh", "pr", "create", "-R", repo, "--head", head, "--base", base, "--title", title, "--body", body], None).strip().splitlines()[-1]
+            p["url"] = self.existing_pr(repo, head)
+            if not p["url"]:
+                p["url"], p["body"] = self.run(["gh", "pr", "create", "-R", repo, "--head", head, "--base", base, "--title", title, "--body", body], None).strip().splitlines()[-1], body
             save()
         url = p["url"]
+        if p.get("body") and not p.get("uncarried"):  # only items written into this PR's body leave the carry, once
+            self.uncarry(repo, p["body"])
+            p["uncarried"] = True
+            save()
         if not p.get("project"):
             self.add_to_project(url)
             p["project"] = True
@@ -214,8 +220,23 @@ class GitHub:
         save()
         for lg in refused: log.warning("review request for %s on %s refused (no access); stays on the Slack fallback", lg, url)
         if len(done) + len(refused) < len(logins): raise RuntimeError(f"review requests on {url} incomplete; run again to finish")
-        if all(f"## {contracts.POST_MERGE_HEAD}{login}" in body for login in self.carried(repo)): self.remember(f"github:carry:{repo.lower()}", None)
         return url
+
+    def uncarry(self, repo: str, body: str):
+        """Removes from the carry each item `body` lists under its login's post-merge heading; an item added since stays for the next PR."""
+        shown: dict[str, list[str]] = {}
+        login = None
+        for line in body.splitlines():
+            if line.startswith("## "): login = line[3 + len(contracts.POST_MERGE_HEAD):] if line[3:].startswith(contracts.POST_MERGE_HEAD) else None
+            elif login is not None and line.startswith("- "): shown.setdefault(login, []).append(line[2:])
+        left = {}
+        for lg, items in self.carried(repo).items():
+            rest, written = [], shown.get(lg, [])
+            for i in items:
+                if i in written: written.remove(i)
+                else: rest.append(i)
+            if rest: left[lg] = rest
+        self.remember(f"github:carry:{repo.lower()}", json.dumps(left, sort_keys=True) if left else None)
 
     # -- R21, R24: the poll ------------------------------------------------------------
     def poll(self, state: State, now: float, deliver=None) -> Poll:
@@ -234,7 +255,7 @@ class GitHub:
             v = self.view(pr)
             rs = self.reviews(pr)
             self.hygiene(pr, state, v, t)
-            self.request(pr, v, t, out, now)
+            self.request(pr, state, v, t, out, now)
             self.review_events(pr, state, v, rs, t, out, now)
             self.gate(pr, state, v, rs, t, out, now)
             for item in out.items:
@@ -262,23 +283,30 @@ class GitHub:
         logins = self.cfg.repo(repo).reviewers or tuple(r.login for r in self.cfg.reviewers if r.login)
         return list(dict.fromkeys(logins))
 
-    def request(self, pr: str, v: dict, t: dict, out: Poll, now: float):
-        """R24: every configured reviewer is requested, once per head; never the author (an implementer never reviews their PR) or a bot."""
+    def auditor(self, state: State) -> str:
+        """The PR's assigned auditor (#27: one reviewer per PR): the GitHub login of the study's peer audit reviewer, "" unless exactly one."""
+        logins = {self.cfg.login_of(sc["reviewer"], state.people) for sc in state.audit_scopes.values() if sc.get("reviewer")}
+        return next(iter(logins)) if len({lg.lower() for lg in logins}) == 1 else ""
+
+    def request(self, pr: str, state: State, v: dict, t: dict, out: Poll, now: float):
+        """R24: the assigned auditor is requested, once per head; never the author (an implementer never reviews their PR) or a bot."""
         head = v.get("headRefOid", "")
+        repo, n = contracts.pr_id(pr)
+        auditor = self.auditor(state)
+        if not auditor and "no-auditor" not in t["seen"]: out.items.append(Item("no-auditor", events=[Event("finding", now, {"text": f"{repo}#{n} has no single assigned auditor with a GitHub login in the study's audit scopes: no review is requested and the driver does not merge it"})]))
         if v.get("state") == "OPEN":
             if t.get("requested_head") != head: t["requested_head"], t["requested"] = head, []
             author = str((v.get("author") or {}).get("login", "")).lower()
-            logins = [lg for lg in self.reviewers(pr) if lg.lower() != author and not self.is_bot({"login": lg})]
+            logins = [lg for lg in [auditor] if lg and lg.lower() != author and not self.is_bot({"login": lg})]
             self.request_each(pr, logins, t["requested"], t.setdefault("refused", []))
-        repo, n = contracts.pr_id(pr)
         for lg in t.get("refused", []):
             if f"refused:{lg}" not in t["seen"]: out.items.append(Item(f"refused:{lg}", events=[Event("finding", now, {"text": f"GitHub refused the review request for {lg} on {repo}#{n} (no access); {lg} stays on the Slack SIGN-OFF fallback"})]))
 
-    def counts(self, pr: str, v: dict, login: str) -> str:
-        """"" when `login`'s review counts (B2: a configured reviewer of the repository, not the PR's author), else why not."""
-        repo, _ = contracts.pr_id(pr)
+    def counts(self, pr: str, state: State, v: dict, login: str) -> str:
+        """"" when `login`'s review counts (the PR's assigned auditor, not the PR's author), else why not."""
+        repo, n = contracts.pr_id(pr)
         if login.lower() == str((v.get("author") or {}).get("login", "")).lower(): return "the PR's author"
-        if login.lower() not in {lg.lower() for lg in self.reviewers(pr)}: return f"not a configured reviewer of {repo}"
+        if login.lower() != self.auditor(state).lower(): return f"not the assigned auditor of {repo}#{n}"
         return ""
 
     def review_events(self, pr: str, state: State, v: dict, rs: list[dict], t: dict, out: Poll, now: float):
@@ -296,7 +324,7 @@ class GitHub:
             if kind not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED") or self.is_bot(r) or r["commit"] != head or (kind != "COMMENTED" and latest.get(login.lower()) is not r):
                 seen.append(rid)  # bots never count; a review of an older head never becomes current; a superseded verdict is not the login's
                 continue
-            why = self.counts(pr, v, login)
+            why = self.counts(pr, state, v, login)
             if why:
                 out.items.append(Item(rid, events=[Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {head[:12]} ({kind}) not counted: {why}: {r['body'].strip()[:500] or '(no text)'}"})]))
                 continue
@@ -340,8 +368,8 @@ class GitHub:
         return [Event("finding", now, {"text": f"post-merge review by {login} on {repo}#{n}: {item}"}) for item in items]
 
     def gate(self, pr: str, state: State, v: dict, rs: list[dict], t: dict, out: Poll, now: float):
-        """R23/R24 merge: `merge = "driver"` repos only, at least one APPROVED from a configured reviewer (not the author, not a bot)
-        and no CHANGES_REQUESTED from a configured reviewer, each a login's latest verdict on the current head (a DISMISSED one counts as neither)."""
+        """R23/R24 merge: `merge = "driver"` repos only, never a draft, once the assigned auditor's latest verdict on the current head
+        is APPROVED (a DISMISSED one is not); head binding, staleness and CI are GitHub's branch protection."""
         repo, n = contracts.pr_id(pr)
         if v.get("state") == "MERGED":
             t.setdefault("merged_at", v.get("mergedAt"))
@@ -353,21 +381,30 @@ class GitHub:
             out.close = True
             return
         head = v.get("headRefOid", "")
-        on_head = [r for r in latest_verdicts(rs).values() if r["commit"] == head and not self.is_bot(r) and not self.counts(pr, v, r["login"])]
+        on_head = [r for r in latest_verdicts(rs).values() if r["commit"] == head and not self.is_bot(r) and not self.counts(pr, state, v, r["login"])]
         approvers = sorted(r["login"] for r in on_head if r["state"] == "APPROVED")
         if not approvers or any(r["state"] == "CHANGES_REQUESTED" for r in on_head): return
         if self.cfg.repo(repo).merge != "driver":
             if f"post:approved-{head[:12]}" not in t["seen"]: out.items.append(Item(f"post:approved-{head[:12]}", posts=[(f"approved-{head[:12]}", f"{pr} approved on {head[:12]} by {', '.join(approvers)}; {repo} is merged by its owner")]))
             return
+        if v.get("isDraft"):  # GitHub refuses to merge a draft: no attempt, one finding per head
+            if f"draft:{head[:12]}" not in t["seen"]: out.items.append(Item(f"draft:{head[:12]}", events=[Event("finding", now, {"text": f"{repo}#{n} is approved on {head[:12]} but is a draft: the driver merges it once it is marked ready for review"})]))
+            return
+        after = None
         try: self.merge(pr, head)
-        except Exception as e:  # noqa: BLE001 - retried on the next poll
+        except Exception as e:  # noqa: BLE001 - retried on the next poll, unless GitHub merged it anyway
             log.warning("merge of %s failed: %s", pr, e)
-            return
+            try: after = self.view(pr)
+            except Exception as e2:  # noqa: BLE001 - retried on the next poll
+                log.warning("view of %s after its failed merge failed: %s", pr, e2)
+                return
+            if after.get("state") != "MERGED" or after.get("headRefOid") != head: return
         t["merge"] = {"head": head, "approvers": approvers}  # L2: the revision and the merged line follow from a view, now or on the next poll
-        try: after = self.view(pr)
-        except Exception as e:  # noqa: BLE001 - the merge stands; the next poll's view records it
-            log.warning("view of %s after its merge failed: %s", pr, e)
-            return
+        if after is None:
+            try: after = self.view(pr)
+            except Exception as e:  # noqa: BLE001 - the merge stands; the next poll's view records it
+                log.warning("view of %s after its merge failed: %s", pr, e)
+                return
         if after.get("state") == "MERGED": self.gate(pr, state, {**after, "mergedAt": after.get("mergedAt") or iso(now)}, rs, t, out, now)
 
     def merged(self, state: State, t: dict, out: Poll):
