@@ -22,6 +22,7 @@ import copy
 from dataclasses import asdict, dataclass, field
 
 from . import briefs, contracts
+from .roles import instructions as role_instructions
 from .config import Config
 
 ORDER = ("Explore", "Claim", "Debate", "Implement", "Audit", "Deliver", "Delivered")
@@ -225,8 +226,11 @@ class M:
     def delegate(self, suffix: str, role: str, brief: str, ephemeral: bool, backend: str = "same") -> dict:
         s = self.s
         w = s.workers.get(role)
-        req = contracts.DelegateRequest(role, brief, "fresh", w["worker_id"] if w else None, ephemeral, backend, "report", (self.aid(suffix),))
-        action = {"action_id": self.aid(suffix), "thread": s.thread, "role": role, **req.body()}
+        catalog_role = "debater" if role in ("mathematician", "physicist") else role
+        lens = role if catalog_role == "debater" else None
+        req = contracts.DelegateRequest(catalog_role, brief, "fresh", w["worker_id"] if w else None, ephemeral, backend, "report", (self.aid(suffix),), role_instructions(catalog_role, lens))
+        action = {"action_id": self.aid(suffix), "thread": s.thread, **req.body()}
+        if lens: action["lens"] = lens  # local correlation only; the host receives the debater role and role prose
         self.emit("delegate", self.aid(suffix), **action)
         return action
 
@@ -393,18 +397,20 @@ class M:
             return
         if k == "delegated":
             if self.awaits(ev["action_id"]):
+                waiting_action = next(a for a in s.waiting["actions"] if a["action_id"] == ev["action_id"])
+                lane = waiting_action.get("lens") or waiting_action["role"]
                 s.group["join_groups"].append(ev["join_group"])
                 for j in ev["jobs"]:
-                    s.group["jobs"][j["job_id"]] = {"role": j["role"], "worker_id": j["worker_id"], "result": None}
-                    s.workers[j["role"]] = {"worker_id": j["worker_id"], "live": True}
-                    if j["role"] in s.group["pending"]: s.group["pending"].remove(j["role"])
+                    s.group["jobs"][j["job_id"]] = {"role": lane, "action_id": ev["action_id"], "worker_id": j["worker_id"], "result": None}
+                    s.workers[lane] = {"worker_id": j["worker_id"], "live": True}
+                    if lane in s.group["pending"]: s.group["pending"].remove(lane)
                 if not s.group["pending"]: s.waiting["kind"], s.phase = "group", "job"
             return
         if k == "delegate_refused":
             if not self.awaits(ev["action_id"]): return
             if any(c in str(ev.get("code", "")) for c in SLOT_CODES):
                 s.phase, s.waiting["kind"] = "slot", "slot"
-                s.waiting["refused"] = ev.get("role")
+                s.waiting["refused"] = ev["action_id"]
             else: self.retry(f"delegate refused: {ev.get('code')}")
             return
         if k == "job_result":
@@ -508,7 +514,7 @@ class M:
         if s.phase == "slot" and s.waiting:
             # A slot freed (interrupted/finished job outside our group): re-send the refused delegate(s).
             for a in s.waiting["actions"]:
-                if s.waiting.get("refused") in (None, a["role"]): self.emit("delegate", a["action_id"], **a)
+                if s.waiting.get("refused") in (None, a["action_id"]): self.emit("delegate", a["action_id"], **a)
             return
         g = s.group
         if not g or jr.job_id not in g["jobs"]:  # job ids are unique; the join group is informational
@@ -538,7 +544,7 @@ class M:
     def debate_done(self, job):
         s = self.s
         st = contracts.parse_stance(job["result"])
-        s.reports[job["role"]] = {"report": job["result"].get("report", ""), "summary": job["result"].get("summary", ""), "stance": st.position or "disagree"}
+        s.reports[job["role"]] = {"report": job["result"].get("report", ""), "summary": job["result"].get("summary", ""), "stance": st.position or contracts.DEFAULT_POSITION}
         if any(j["result"] is None for j in s.group["jobs"].values()) or s.group["pending"]: return
         self.cancel("timer")
         if all(s.reports.get(r, {}).get("stance") == "agree" for r in ("mathematician", "physicist")): self.enter_synthesis()
@@ -561,7 +567,7 @@ class M:
         s = self.s
         r = job["result"]
         s.workers.pop("auditor", None)
-        verdict = contracts.parse_stance(r).verdict or "return"
+        verdict = contracts.parse_stance(r).verdict or contracts.DEFAULT_VERDICT
         s.audit = {"summary": r.get("summary", ""), "verdict": verdict, "report": r.get("report", "")}
         if verdict == "reject":
             self.emit("post", self.aid("reject"), thread=s.thread, post_kind="report", text="\n".join([contracts.stage_line("Audit", s.iteration), "verdict: reject (out of scope); the owner decides", f"ref: {self.aid('reject')}"]), details=None)
