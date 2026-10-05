@@ -60,6 +60,8 @@ class Item:
 @dataclass
 class Poll:
     items: list[Item] = field(default_factory=list)
+    close: bool = False  # the PR needs no more polls once every item was delivered
+    retry: bool = False  # an effect failed this poll (an acknowledgement): the PR stays polled so it is tried again
 
     @property
     def posts(self) -> list[tuple[str, str]]: return [p for i in self.items for p in i.posts]
@@ -238,6 +240,7 @@ class GitHub:
             for item in out.items:
                 if deliver is not None: deliver(item)
                 seen.append(item.key)
+            if out.close and not out.retry: t["done"] = True  # only after every item was delivered and no effect waits for a retry
         finally:
             self.remember(key, json.dumps(t, sort_keys=True))
         return out
@@ -308,7 +311,9 @@ class GitHub:
                 events.append(Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {head[:12]} ({kind}): no Slack id maps to {login}, so no audit card closes on it; map it in [people]"}))
             if kind == "CHANGES_REQUESTED" and after:
                 acked = self.acknowledge(pr, login, r, t, out, now)
-                if acked is None: continue  # B1: the reply failed; the review stays unseen and is acknowledged on the next poll
+                if acked is None:  # B1: the reply failed; the review stays unseen and is acknowledged on the next poll
+                    out.retry = True
+                    continue
                 events += acked
             out.items.append(Item(rid, events=events))
 
@@ -342,10 +347,10 @@ class GitHub:
             t.setdefault("merged_at", v.get("mergedAt"))
             if not t.get("merged_sha"): t["merged_sha"] = (v.get("mergeCommit") or {}).get("oid")
             if t.get("merge"): self.merged(state, t, out)
-            if t.get("merged_at") and now > parse_iso(t["merged_at"]) + self.g.post_merge_window: t["done"] = True
+            if t.get("merged_at") and now > parse_iso(t["merged_at"]) + self.g.post_merge_window: out.close = True
             return
         if v.get("state") != "OPEN":
-            t["done"] = True
+            out.close = True
             return
         head = v.get("headRefOid", "")
         on_head = [r for r in latest_verdicts(rs).values() if r["commit"] == head and not self.is_bot(r) and not self.counts(pr, v, r["login"])]
