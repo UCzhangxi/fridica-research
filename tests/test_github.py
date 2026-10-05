@@ -704,3 +704,113 @@ def test_round4_5_a_merge_that_errors_after_github_merged_records_the_squash_sha
     assert len(gh.argv("gh", "pr", "merge")) == 1 and meta["github:revision:o/r:g1"] == SQUASH
     assert out.posts[-1] == (f"merged-{HEAD[:12]}", f"merged o/r#9 (squash) as {SQUASH} after approval by reviewer on {HEAD[:12]}")
     assert poll(g, w).posts == [] and len(gh.argv("gh", "pr", "merge")) == 1  # once
+
+
+# -- round 5: an approval that stops counting reopens the audit; every late review is its own --------------------------
+def held_world(cfg=GCFG) -> World:
+    """An audit world whose deliver call is left unanswered, so an approval leaves the study in Deliver."""
+    w = World(cfg=cfg)
+    react = w.react
+
+    def hold_deliver(actions):
+        held = [a for a in actions if a.kind == "llm_call" and a["name"] == "study_deliver"]
+        react([a for a in actions if a not in held])
+        w.actions.extend(held)
+    w.react = hold_deliver
+    w.to_audit()
+    return w
+
+
+def approved_in_deliver(cfg=GCFG):
+    """The auditor's APPROVED review is delivered (scope approved, study in Deliver) and the first merge fails, so the PR stays open."""
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
+    g, meta = make(gh, cfg)
+    w = held_world(cfg)
+    gh.fail_once(lambda a: a[:3] == ["gh", "pr", "merge"])
+    poll(g, w)
+    assert w.state.stage == "Deliver" and w.state.audit_scopes["scope"]["verdict"] == "approve" and len(gh.argv("gh", "pr", "merge")) == 1
+    return gh, g, w
+
+
+def assert_reopened(w: World, gh: FakeGh, merges: int = 1):
+    assert w.state.stage == "Explore" and w.state.iteration == 2 and w.state.audit["verdict"] == "return"
+    assert any("peer review asked for changes: scope=dismissed" in f for f in w.state.findings)
+    assert len(gh.argv("gh", "pr", "merge")) == merges  # the withdrawn approval never merges
+
+
+def test_round5_a_a_dismissed_approval_reopens_its_audit_scope():
+    gh, g, w = approved_in_deliver()
+    gh.prs[("o/r", "9")]["reviews"][0]["state"] = "DISMISSED"  # dismissed by hand: id, commit and submitted_at unchanged
+    out = poll(g, w)
+    assert ("dismissed-1", f"SIGN-OFF (GitHub review, mirrored) reviewer: DISMISSED on o/r#9 at {HEAD[:12]}") in out.posts
+    assert [e.data for e in out.events if e.kind == "sign_off"] == [{"sender": REV, "pr": PR, "sha": HEAD, "verdict": "dismissed"}]
+    assert_reopened(w, gh)
+    out = poll(g, w)
+    assert out.items == [] and sum("was dismissed" in f for f in w.state.findings) == 1  # withdrawn once
+
+
+@pytest.mark.parametrize("dismissed", [True, False])
+def test_round5_a_a_push_withdraws_the_approval_of_the_old_head(dismissed):
+    """Branch protection dismisses a stale approval on push (its commit_id stays the old head); without that rule it only stops counting."""
+    gh, g, w = approved_in_deliver()
+    pr = gh.prs[("o/r", "9")]
+    pr["headRefOid"] = "abcdef1" + "2" * 33
+    if dismissed: pr["reviews"][0]["state"] = "DISMISSED"
+    out = poll(g, w)
+    assert (("dismissed-1", f"SIGN-OFF (GitHub review, mirrored) reviewer: DISMISSED on o/r#9 at {HEAD[:12]}") in out.posts) == dismissed
+    assert any(e.kind == "sign_off" and e.data["verdict"] == "dismissed" and e.data["sha"] == HEAD for e in out.events)
+    assert_reopened(w, gh)
+
+
+def test_round5_a_an_approval_superseded_by_a_dismissed_changes_request_is_withdrawn():
+    gh, g, w = approved_in_deliver()
+    gh.prs[("o/r", "9")]["reviews"].append(rv(2, "reviewer", "DISMISSED", at="2026-10-04T11:00:00Z", body="wait"))  # a changes request dismissed before the poll
+    out = poll(g, w)
+    assert any(f.endswith("no longer counts (superseded by a later DISMISSED review): it is withdrawn from the audit") for f in w.state.findings) and out.events
+    assert_reopened(w, gh)
+
+
+def test_round5_a_an_approval_by_a_login_that_is_no_longer_the_auditor_is_withdrawn():
+    cfg = dataclasses.replace(GCFG, reviewers=(Reviewer(REV, "scope"),), people={OWNER: "chengcli"})  # the auditor's login is learned in the thread
+    gh = FakeGh((PR, {"reviews": [rv(1, "reviewer", "APPROVED")]}))
+    g, _ = make(gh, cfg)
+    w = held_world(cfg)
+    w.ev("login_reply", sender=REV, login="reviewer")
+    gh.fail_once(lambda a: a[:3] == ["gh", "pr", "merge"])
+    poll(g, w)
+    assert w.state.stage == "Deliver" and w.state.audit_scopes["scope"]["verdict"] == "approve"
+    w.ev("login_reply", sender=REV, login="reviewer-new")
+    poll(g, w)
+    assert any(f.endswith("no longer counts (not the assigned auditor of o/r#9): it is withdrawn from the audit") for f in w.state.findings)
+    assert_reopened(w, gh)
+
+
+def test_round5_b_every_post_merge_changes_review_is_acknowledged_and_carried_once():
+    gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}}))
+    g, _ = make(gh)
+    w = audit_world()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    poll(g, w)
+    rs = gh.prs[("o/r", "9")]["reviews"]
+    rs += [rv(9, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T13:00:00Z", body="- rename foo"), rv(10, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T14:00:00Z", body="- add a test")]
+    out = poll(g, w)  # two late changes requests in one poll
+    poll(g, w)
+    ack = "acknowledged, goes into the next PR: post-merge review by reviewer on o/r#9"
+    assert [d["body"] for _, d in gh.api("repos/o/r/issues/9/comments")] == ["@reviewer acknowledged, goes into the next PR."] * 2
+    assert [p for p in out.posts if p[0].startswith("ack-")] == [("ack-9", ack), ("ack-10", ack)] and [k for k, _ in out.posts if k.startswith("review-")] == ["review-9", "review-10"]
+    assert g.carried("o/r") == {"reviewer": ["rename foo", "add a test"]}
+    assert [f.rsplit(": ", 1)[1] for f in w.state.findings if "post-merge review by reviewer" in f] == ["rename foo", "add a test"]
+    rs += [rv(12, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T15:00:00Z", body="- fix baz"), rv(13, "reviewer", "APPROVED", at="2026-10-04T16:00:00Z")]
+    out = poll(g, w)  # a late approval in the same poll does not swallow the changes request before it
+    assert ("ack-12", ack) in out.posts and len(gh.api("repos/o/r/issues/9/comments")) == 3 and g.carried("o/r")["reviewer"][-1] == "fix baz"
+
+
+def test_round5_b_reviews_of_one_login_in_one_poll_each_keep_their_mirror_line_or_finding():
+    gh = FakeGh((PR, {"reviews": [rv(5, "reviewer", "APPROVED", at="2026-10-04T10:00:00Z"), rv(6, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T11:00:00Z"),
+                                  rv(7, "stranger", "APPROVED", body="one"), rv(8, "stranger", "CHANGES_REQUESTED", at="2026-10-04T11:00:00Z", body="two")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    out = poll(g, w)
+    assert [k for k, _ in out.posts] == ["review-5", "review-6"] and [e.data["verdict"] for e in out.events if e.kind == "sign_off"] == ["changes"]
+    assert [f.rsplit(": ", 1)[1] for f in w.state.findings if "by stranger" in f] == ["one", "two"]
+    assert not gh.argv("gh", "pr", "merge")

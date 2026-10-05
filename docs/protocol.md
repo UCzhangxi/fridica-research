@@ -252,7 +252,8 @@ and its reviews from REST (`gh api --paginate repos/<owner>/<repo>/pulls/<n>/rev
 `user.login`, `user.type`, `state`, `commit_id`, `submitted_at`); `gh pr view --json latestReviews`
 is never used, since gh leaves its review id and commit oid empty. A login's verdict is its
 latest `APPROVED`, `CHANGES_REQUESTED` or `DISMISSED` review (greatest `submitted_at`, then `id`); a
-later `COMMENTED` review does not replace it, and a superseded verdict is never delivered.
+later `COMMENTED` review does not replace it, and a verdict superseded before the merge is mirrored
+but never delivered; every review after the merge is delivered on its own, however many arrive in one poll.
 Reviews are requested through REST, never `gh pr edit`: one
 `POST repos/<owner>/<repo>/pulls/<n>/requested_reviewers` per head for the PR's assigned auditor (the
 GitHub login of the study's one peer audit reviewer; with none or several, nothing is requested, nothing
@@ -276,14 +277,17 @@ Each counted review is mirrored into the study thread as exactly one line,
 `SIGN-OFF (GitHub review, mirrored) <login>: <STATE> on <owner/repo>#<n> at <sha>`, with a
 `ref:` line; the marker makes `contracts.parse_signoff` return nothing for it, and own posts are
 never parsed for sign-offs, so the mirror is the record and never a second sign-off. A mirrored
-review that GitHub later shows as `DISMISSED` on the current head is mirrored once more with that
+review that GitHub later shows as `DISMISSED` (by hand, or as stale after a push) is mirrored once more with that
 state, with a finding (`GitHub review by <login> ... was dismissed: it no longer counts toward the
-merge`); a dismissed verdict never counts for the merge. Each post
+merge`); a dismissed verdict never counts for the merge. A delivered approval that stops counting
+(dismissed, superseded by a later verdict of its login that is not an approval, on a head that is no
+longer the PR's, or its login no longer the assigned auditor) is withdrawn once as `sign_off
+dismissed`, which reopens the scope it approved exactly as a later `changes` does. Each post
 and each review's events is marked seen (store meta) only after the driver delivered it (posted,
 applied to the machine); one that fails is delivered again on the next poll. The Slack
 `SIGN-OFF` line stays the fallback for reviewers without repository access. The audit verdict is
 pass only when every reviewer's scope is signed off approve on the reviewed head; a later `changes`
-from that reviewer on the head reopens the scope (in Audit or Deliver the study returns) until a new approval.
+from that reviewer on the head, or a withdrawn GitHub approval, reopens the scope (in Audit or Deliver the study returns) until a new approval.
 
 A PR is named by its repository and number (`contracts.pr_id`: a URL, `owner/repo#N`, `#N` or
 `N`); two names denote the same PR when the numbers match and, whenever both carry a repository,

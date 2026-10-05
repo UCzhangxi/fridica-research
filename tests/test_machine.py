@@ -508,3 +508,25 @@ def test_round4_2_a_later_changes_from_the_auditor_reopens_an_approved_scope():
     assert w.state.stage == "Deliver"
     w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="changes")
     assert w.state.stage == "Explore" and w.state.iteration == 2 and w.state.audit["verdict"] == "return"
+
+
+def test_round5_a_withdrawn_approval_reopens_only_an_approved_scope_on_the_reviewed_head():
+    """`sign_off dismissed` (github.py, an approval GitHub no longer counts) reopens a scope as a later `changes` does; it never signs an open scope."""
+    cfg = dataclasses.replace(CFG, reviewers=(Reviewer(REV, "scope"), Reviewer("UREV2", "code")), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="dismissed")
+    assert w.state.audit_scopes["scope"]["signed_at"] is None and REV not in w.state.signoffs  # nothing to take back
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    n = len(w.state.findings)
+    w.ev("sign_off", sender=REV, pr=PR, sha="fedcba9", verdict="dismissed")
+    assert w.state.audit_scopes["scope"]["verdict"] == "approve" and len(w.state.findings) == n  # another head: no reopen, no noise
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="dismissed")
+    assert w.state.audit_scopes["scope"]["verdict"] == "dismissed"
+    w.ev("sign_off", sender="UREV2", pr=PR, sha=SHA, verdict="approve")
+    assert w.state.stage == "Explore" and w.state.iteration == 2 and w.state.audit["verdict"] == "return" and "scope=dismissed" in w.state.findings[n]
+    w = World(cfg=cfg)  # a new approval after the withdrawal passes again
+    w.to_audit()
+    for verdict in ("approve", "dismissed", "approve"): w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict=verdict)
+    w.ev("sign_off", sender="UREV2", pr=PR, sha=SHA, verdict="approve")
+    assert w.state.stage == "Delivered" and w.state.audit["verdict"] == "pass"

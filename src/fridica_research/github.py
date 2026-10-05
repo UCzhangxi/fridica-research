@@ -13,10 +13,11 @@ tests answer them with a fake. For the PR of a study in Audit, Deliver or Delive
   `sign_off changes` (login -> Slack id through `Config.slack_of`), COMMENTED -> a finding without
   verdict; each counted review is mirrored into the study thread as one SIGN-OFF line that the
   driver never parses back (`contracts.MIRROR_MARK`), and once more as DISMISSED (with a finding) if GitHub dismisses it;
+  a delivered approval that stops counting is withdrawn once (`sign_off dismissed`), reopening the scope it approved;
 - for a `[repos]` entry with `merge = "driver"` squash-merges an open, non-draft PR once the assigned auditor's
   verdict on the current head is APPROVED (`--match-head-commit`; GitHub's branch protection enforces the rest), and
   records the squash sha; for `merge = "owner"` it posts the approved PR once and waits;
-- after the merge, a CHANGES_REQUESTED review gets one reply on the PR and one line in the thread
+- after the merge, each CHANGES_REQUESTED review (every one, keyed by its id) gets one reply on the PR and one line in the thread
   ("acknowledged, goes into the next PR"), its items become findings, and the next PR body to that
   repository lists them under "From post-merge review by <login>".
 
@@ -257,6 +258,7 @@ class GitHub:
             self.hygiene(pr, state, v, t)
             self.request(pr, state, v, t, out, now)
             self.review_events(pr, state, v, rs, t, out, now)
+            self.withdrawals(pr, state, v, rs, t, out, now)
             self.gate(pr, state, v, rs, t, out, now)
             for item in out.items:
                 if deliver is not None: deliver(item)
@@ -317,12 +319,12 @@ class GitHub:
         latest = latest_verdicts(rs)
         for r in rs:
             rid, kind, login = r["id"], r["state"], r["login"]
-            if kind == "DISMISSED" and f"post:review-{rid}" in seen and f"dismissed:{rid}" not in seen and r["commit"] == head:
-                # F3: a counted review GitHub now shows as dismissed is taken back in the thread and the study's findings
-                out.items.append(Item(f"dismissed:{rid}", posts=[(f"dismissed-{rid}", contracts.mirror_line(login, kind, pr, head))], events=[Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {head[:12]} was dismissed: it no longer counts toward the merge"})]))
+            if kind == "DISMISSED" and f"post:review-{rid}" in seen and f"dismissed:{rid}" not in seen:
+                # F3: a counted review GitHub now shows as dismissed (by hand, or as stale after a push) is taken back in the thread and the findings
+                out.items.append(Item(f"dismissed:{rid}", posts=[(f"dismissed-{rid}", contracts.mirror_line(login, kind, pr, r["commit"]))], events=[Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {r['commit'][:12]} was dismissed: it no longer counts toward the merge"})]))
             if rid in seen: continue
-            if kind not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED") or self.is_bot(r) or r["commit"] != head or (kind != "COMMENTED" and latest.get(login.lower()) is not r):
-                seen.append(rid)  # bots never count; a review of an older head never becomes current; a superseded verdict is not the login's
+            if kind not in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED") or self.is_bot(r) or r["commit"] != head:
+                seen.append(rid)  # bots never count; a review of an older head never becomes current
                 continue
             why = self.counts(pr, state, v, login)
             if why:
@@ -330,11 +332,15 @@ class GitHub:
                 continue
             after = bool(merged_at and r["at"] > merged_at)
             if f"post:review-{rid}" not in seen: out.items.append(Item(f"post:review-{rid}", posts=[(f"review-{rid}", contracts.mirror_line(login, kind, pr, head, after))]))
+            if kind != "COMMENTED" and not after and latest.get(login.lower()) is not r:
+                out.items.append(Item(rid))  # a superseded verdict before the merge is mirrored but is not the login's; every post-merge review is its own
+                continue
             events = []
             if kind == "COMMENTED":
                 events.append(Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {head[:12]} (COMMENTED, no verdict): {r['body'].strip()[:500] or '(no text)'}"}))
             elif slack := self.cfg.slack_of(login, state.people):
                 events.append(Event("sign_off", now, {"sender": slack, "pr": pr, "sha": head, "verdict": "approve" if kind == "APPROVED" else "changes"}))
+                if kind == "APPROVED": t.setdefault("approvals", {})[rid] = slack  # withdrawn from that sender once it stops counting (`withdrawals`)
             else:
                 events.append(Event("finding", now, {"text": f"GitHub review by {login} on {repo}#{n} at {head[:12]} ({kind}): no Slack id maps to {login}, so no audit card closes on it; map it in [people]"}))
             if kind == "CHANGES_REQUESTED" and after:
@@ -366,6 +372,25 @@ class GitHub:
             self.remember(f"github:carry:{repo.lower()}", json.dumps(carry, sort_keys=True))
             t["carried"].append(rid)
         return [Event("finding", now, {"text": f"post-merge review by {login} on {repo}#{n}: {item}"}) for item in items]
+
+    def withdrawals(self, pr: str, state: State, v: dict, rs: list[dict], t: dict, out: Poll, now: float):
+        """An approval that was delivered as `sign_off approve` and no longer counts (dismissed, superseded by a later verdict of
+        its login that is not an approval, on a head that is no longer the PR's, or its login no longer the assigned auditor)
+        is withdrawn once: `sign_off dismissed` reopens the scope it approved as a later `changes` does, and a finding says why."""
+        head, seen = v.get("headRefOid", ""), t["seen"]
+        repo, n = contracts.pr_id(pr)
+        latest, by_id = latest_verdicts(rs), {r["id"]: r for r in rs}
+        for rid, slack in t.get("approvals", {}).items():
+            r = by_id.get(rid)
+            if r is None or rid not in seen or f"withdrawn:{rid}" in seen: continue
+            last = latest.get(r["login"].lower(), r)
+            superseded = last is not r and last["state"] != "APPROVED" and not (last["state"] == "CHANGES_REQUESTED" and last["commit"] == head)  # a changes on the head reopens by itself
+            why = ("dismissed" if r["state"] == "DISMISSED" else f"the PR's head is now {head[:12]}" if r["commit"] != head
+                   else f"superseded by a later {last['state']} review" if superseded else self.counts(pr, state, v, r["login"]))
+            if not why: continue
+            events = [Event("sign_off", now, {"sender": slack, "pr": pr, "sha": r["commit"], "verdict": "dismissed"})]
+            if why != "dismissed": events.append(Event("finding", now, {"text": f"GitHub approval by {r['login']} on {repo}#{n} at {r['commit'][:12]} no longer counts ({why}): it is withdrawn from the audit"}))  # a dismissal has its own finding (F3)
+            out.items.append(Item(f"withdrawn:{rid}", events=events))
 
     def gate(self, pr: str, state: State, v: dict, rs: list[dict], t: dict, out: Poll, now: float):
         """R23/R24 merge: `merge = "driver"` repos only, never a draft, once the assigned auditor's latest verdict on the current head

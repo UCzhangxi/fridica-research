@@ -33,6 +33,7 @@ OVERRUN_FACTOR = 2.0
 PERSISTENT = ("mathematician", "physicist", "implementer")
 SLOT_CODES = ("too_many_workers", "worker_limit", "too many persistent workers")
 MAX_POST_TRIES = 3  # posts of the same text before a rate-limit/failure refusal becomes a stage failure (rule R)
+REOPEN = ("changes", "dismissed")  # scope verdicts that keep the audit from passing: a changes request, or a withdrawn approval
 
 
 @dataclass(frozen=True)
@@ -365,17 +366,19 @@ class M:
             self.peer_post()
             return
         if k == "sign_off":
+            withdrawn = ev["verdict"] == "dismissed"  # GitHub no longer counts an approval it mirrored (github.py); never from Slack
             if not head_matches(ev.get("pr", ""), ev.get("sha", ""), s.implementer.get("pr", ""), s.implementer.get("sha", "")):
                 # A sign-off names the head it reviewed; one for another PR or sha is noted, never counted.
-                s.findings.append(f"iteration {s.iteration} sign-off from {ev['sender']} ignored: {ev.get('pr')} {ev.get('sha')} is not the reviewed head {s.implementer.get('pr') or 'none'} {s.implementer.get('sha') or 'none'}")
+                if not withdrawn: s.findings.append(f"iteration {s.iteration} sign-off from {ev['sender']} ignored: {ev.get('pr')} {ev.get('sha')} is not the reviewed head {s.implementer.get('pr') or 'none'} {s.implementer.get('sha') or 'none'}")
                 return
-            s.signoffs[ev["sender"]] = ev["verdict"]
             reopened = False
             for sc in s.audit_scopes.values():
-                # before delivery a later verdict on the reviewed head replaces the earlier one: a `changes` after an approval reopens the scope
-                if sc["reviewer"] == ev["sender"] and (sc["signed_at"] is None or (s.stage in ("Audit", "Deliver") and sc["verdict"] != ev["verdict"])):
-                    reopened |= sc["signed_at"] is not None and ev["verdict"] == "changes"
+                # before delivery a later verdict on the reviewed head replaces the earlier one: a `changes` after an approval reopens the scope,
+                # and so does a withdrawn approval (it only ever takes back an approval, never signs an open scope)
+                if sc["reviewer"] == ev["sender"] and (sc["verdict"] == "approve" and s.stage in ("Audit", "Deliver") if withdrawn else sc["signed_at"] is None or (s.stage in ("Audit", "Deliver") and sc["verdict"] != ev["verdict"])):
+                    reopened |= sc["signed_at"] is not None and ev["verdict"] in REOPEN
                     sc.update(verdict=ev["verdict"], signed_at=ev.now)
+            if not withdrawn or reopened: s.signoffs[ev["sender"]] = ev["verdict"]
             self.mirror_scopes()
             self.board()
             if s.stage == "Audit" and s.phase == "signoff": self.check_signoffs()
@@ -467,7 +470,7 @@ class M:
     def return_for_changes(self) -> bool:
         s = self.s
         peers = [sc for sc in s.audit_scopes.values() if sc["reviewer"]]
-        if not any(sc["verdict"] == "changes" for sc in peers): return False
+        if not any(sc["verdict"] in REOPEN for sc in peers): return False
         s.audit["verdict"] = "return"
         self.cancel_all()
         self.next_iteration(f"iteration {s.iteration} peer review asked for changes: " + ", ".join(f"{scope}={sc['verdict']}" for scope, sc in sorted(s.audit_scopes.items()) if sc["reviewer"]))
