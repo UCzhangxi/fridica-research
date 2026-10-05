@@ -518,6 +518,61 @@ def test_merged_pr_stops_polling_after_the_window():
     assert len(gh.argv("gh", "pr", "view")) == 2  # inside the window, then the poll that finds it over; none after
 
 
+
+def test_round3_b1_a_failed_acknowledgement_after_the_window_is_retried_with_each_effect_once():
+    late = rv(9, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T13:00:00Z", body="- rename foo\n")
+    gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}, "reviews": [late]}))
+    g, _ = make(gh, dataclasses.replace(GCFG, github=GitHubCfg(enabled=True, poll_interval=0, post_merge_window=7200)))
+    w = audit_world()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    end = parse_iso(MERGED_AT) + 7200 + 1  # the first poll comes after the post-merge window closed
+    gh.fail_once(lambda a: "repos/o/r/issues/9/comments" in a)
+    out = poll(g, w, end)
+    assert "9" not in [i.key for i in out.items]
+    out = poll(g, w, end + 10)
+    poll(g, w, end + 20)
+    assert len(gh.api("repos/o/r/issues/9/comments")) == 2  # the failed reply, then the retry; none after
+    assert ("ack-9", "acknowledged, goes into the next PR: post-merge review by reviewer on o/r#9") in out.posts
+    assert sum(f.endswith("post-merge review by reviewer on o/r#9: rename foo") for f in w.state.findings) == 1
+    assert g.carried("o/r") == {"reviewer": ["rename foo"]}
+    assert len(gh.argv("gh", "pr", "view")) == 2  # done once the acknowledgement was delivered; no poll after
+
+
+def test_round3_a_delivery_that_raises_after_the_window_is_redelivered():
+    late = rv(9, "reviewer", "CHANGES_REQUESTED", at="2026-10-04T13:00:00Z", body="- rename foo\n")
+    gh = FakeGh((PR, {"state": "MERGED", "mergedAt": MERGED_AT, "mergeCommit": {"oid": SQUASH}, "reviews": [late]}))
+    g, _ = make(gh, dataclasses.replace(GCFG, github=GitHubCfg(enabled=True, poll_interval=0, post_merge_window=7200)))
+    w = audit_world()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    end = parse_iso(MERGED_AT) + 7200 + 1
+    calls: list[str] = []
+
+    def deliver(item):
+        calls.append(item.key)
+        if item.key == "9" and calls.count("9") == 1: raise RuntimeError("store busy")
+        for ev in item.events: w.feed(ev)
+    with pytest.raises(RuntimeError): g.poll(w.state, end, deliver)
+    g.poll(w.state, end + 10, deliver)
+    g.poll(w.state, end + 20, deliver)
+    assert calls.count("9") == 2 and calls.count("post:ack-9") == 1 and len(gh.api("repos/o/r/issues/9/comments")) == 1
+    assert sum(f.endswith("post-merge review by reviewer on o/r#9: rename foo") for f in w.state.findings) == 1
+
+
+def test_round3_a_closed_prs_findings_are_delivered_before_it_is_done():
+    gh = FakeGh((PR, {"state": "CLOSED", "reviews": [rv(1, "reviewer", "COMMENTED", body="nit")]}))
+    g, _ = make(gh)
+    w = audit_world()
+    calls: list[str] = []
+
+    def deliver(item):
+        calls.append(item.key)
+        if item.key == "1" and calls.count("1") == 1: raise RuntimeError("store busy")
+        for ev in item.events: w.feed(ev)
+    with pytest.raises(RuntimeError): g.poll(w.state, w.now, deliver)
+    g.poll(w.state, w.now, deliver)
+    g.poll(w.state, w.now, deliver)
+    assert calls.count("1") == 2 and sum("COMMENTED" in f for f in w.state.findings) == 1 and len(gh.argv("gh", "pr", "view")) == 2
+
 # -- pr_id and the short-sha guard ---------------------------------------------------------
 def test_two_prs_12_in_two_repos():
     a, b = "https://github.com/a/x/pull/12", "https://github.com/b/y/pull/12"
