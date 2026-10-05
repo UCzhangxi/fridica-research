@@ -231,8 +231,62 @@ class SignOff:
 
 
 def parse_signoff(text: str) -> SignOff | None:
+    if MIRROR_MARK in text: return None  # the driver's mirror of a GitHub review is the record, never a sign-off (R21)
     m = _SIGNOFF.search(text)
     return SignOff(m.group("pr"), m.group("sha"), m.group("verdict").lower()) if m else None
+
+
+# -- GitHub pull requests (R21, R23, R24) ------------------------------------------
+MIRROR_MARK = "(GitHub review, mirrored)"
+_PR_URL = re.compile(r"github\.com/(?P<repo>[^/\s]+/[^/\s]+)/pull/(?P<n>\d+)")
+_PR_SHORT = re.compile(r"^(?:(?P<repo>[\w.-]+/[\w.-]+))?#?(?P<n>\d+)$")
+
+
+def pr_id(x: str) -> tuple[str, str]:
+    """`(owner/repo, number)` of a PR named as a URL, `owner/repo#N`, `#N` or `N`; the repo is "" when the name does not carry it."""
+    x = str(x).strip().rstrip("/")
+    m = _PR_URL.search(x) or _PR_SHORT.match(x)
+    if not m: return "", x.rsplit("/", 1)[-1].lstrip("#")
+    return (m.group("repo") or "").lower(), m.group("n")
+
+
+def same_pr(a: str, b: str) -> bool:
+    """Two PR names denote the same PR: equal numbers, and equal repositories whenever both names carry one (two #12 in two repos differ)."""
+    (ra, na), (rb, nb) = pr_id(a), pr_id(b)
+    return na == nb and (not ra or not rb or ra == rb)
+
+
+def mirror_line(login: str, review_state: str, pr: str, sha: str, after_merge: bool = False) -> str:
+    """The one line the driver posts in the study thread for a GitHub review; `parse_signoff` never reads it back."""
+    repo, n = pr_id(pr)
+    return f"SIGN-OFF {MIRROR_MARK} {login}: {review_state} on {repo}#{n} at {sha[:12]}" + (" (after merge)" if after_merge else "")
+
+
+POST_MERGE_HEAD = "From post-merge review by "
+
+
+def pr_body(summary: str, closes: int | None, thread: str, board_url: str, milestone: str, carried: dict | None = None) -> str:
+    """R23 PR body: `Closes #N`, the study thread, the board link and the generation milestone; R24 carried post-merge items last."""
+    out = [summary.strip(), "", f"Closes #{closes}" if closes else "", f"Study thread: {thread}", f"Board: {board_url}", f"Milestone: {milestone}"]
+    for login, items in (carried or {}).items():
+        out += ["", f"## {POST_MERGE_HEAD}{login}", *[f"- {i}" for i in items]]
+    return "\n".join(out).strip() + "\n"
+
+
+def pr_hygiene_missing(body: str) -> list[str]:
+    """The R23 lines a PR body lacks; the driver refuses to open a PR while this is non-empty."""
+    return [name for name, rx in _HYGIENE if not re.search(rx, body, re.M | re.I)]
+
+
+# The study line, the board link and the milestone each on its own line (`pr_body`), or sharing one line
+# ("Study: Slack study thread <ts>, board <url>, milestone R2").
+_MILESTONE = r"(?:^Milestone:|\bmilestone) (R\d+)\b"
+_HYGIENE = (("Closes #N", r"^Closes #\d+\s*$"), ("study thread", r"^(?:Study thread: \S+|Study:.*\bstudy thread \S+)"), ("board link", r"(?:^Board:|\bboard) https://github\.com/\S+"), ("milestone", _MILESTONE))
+
+
+def pr_milestone(body: str) -> str:
+    """The generation milestone (`R<n>`) a hygienic PR body names."""
+    return re.search(_MILESTONE, body, re.M | re.I).group(1).upper()
 
 
 _LOGIN = re.compile(r"^\s*(?:(?:github|login)(?: login)?:\s*)?@?(?P<login>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\s*$")

@@ -376,7 +376,9 @@ def test_signoff_for_another_head_is_ignored_and_noted():
     w.ev("sign_off", sender="UREV", pr="https://github.com/o/r/pull/10", sha=SHA, verdict="approve")
     assert w.state.stage == "Audit" and w.state.signoffs == {} and w.state.audit_scopes["scope"]["signed_at"] is None
     assert len(w.state.findings) == 2 and "sign-off from UREV ignored" in w.state.findings[0] and "pull/10" in w.state.findings[1]
-    w.ev("sign_off", sender="UREV", pr="9", sha="abc12", verdict="approve")  # a bare number and a sha prefix name the same head
+    w.ev("sign_off", sender="UREV", pr="9", sha="abc12", verdict="approve")  # a prefix shorter than 7 hex digits names no head
+    assert w.state.stage == "Audit" and len(w.state.findings) == 3
+    w.ev("sign_off", sender="UREV", pr="o/r#9", sha="ABC1234", verdict="approve")  # owner/repo#N and the sha in any case name the same head
     assert w.state.stage == "Delivered" and w.state.signoffs == {"UREV": "approve"}
 
 
@@ -475,3 +477,56 @@ def test_audit_completes_at_once_when_all_scopes_are_peers_and_signoffs_optional
     assert "auditor" not in [a["role"] for a in w.kinds("delegate")]
     assert w.state.stage == "Delivered" and w.state.audit["verdict"] == "pass" and w.state.audit_scopes["scope"]["signed_at"] is None
     assert [r["stage"] for r in w.state.stage_log] == ["Explore", "Claim", "Debate", "Implement", "Audit", "Deliver"]
+
+
+def test_round4_2_a_later_changes_from_the_auditor_reopens_an_approved_scope():
+    """A `changes` after an approval on the reviewed head reopens that scope: the audit does not pass until a new approval."""
+    cfg = dataclasses.replace(CFG, reviewers=(Reviewer(REV, "scope"), Reviewer("UREV2", "code")), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="changes")
+    assert w.state.audit_scopes["scope"]["verdict"] == "changes"
+    w.ev("sign_off", sender="UREV2", pr=PR, sha=SHA, verdict="approve")
+    assert w.state.stage == "Explore" and w.state.iteration == 2 and w.state.audit["verdict"] == "return" and "scope=changes" in w.state.findings[0]
+    w = World(cfg=cfg)  # a new approval on the head after the changes passes again
+    w.to_audit()
+    for verdict in ("approve", "changes", "approve"): w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict=verdict)
+    w.ev("sign_off", sender="UREV2", pr=PR, sha=SHA, verdict="approve")
+    assert w.state.stage == "Delivered" and w.state.audit["verdict"] == "pass"
+    one = dataclasses.replace(CFG, audit_scopes=("scope",), require_signoffs=True)
+    w = World(cfg=one)  # the changes lands while the deliver call runs: the study returns instead of delivering with audit pass
+    react = w.react
+
+    def hold_deliver(actions):  # the deliver call is left unanswered
+        held = [a for a in actions if a.kind == "llm_call" and a["name"] == "study_deliver"]
+        react([a for a in actions if a not in held])
+        w.actions.extend(held)
+    w.react = hold_deliver
+    w.to_audit()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    assert w.state.stage == "Deliver"
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="changes")
+    assert w.state.stage == "Explore" and w.state.iteration == 2 and w.state.audit["verdict"] == "return"
+
+
+def test_round5_a_withdrawn_approval_reopens_only_an_approved_scope_on_the_reviewed_head():
+    """`sign_off dismissed` (github.py, an approval GitHub no longer counts) reopens a scope as a later `changes` does; it never signs an open scope."""
+    cfg = dataclasses.replace(CFG, reviewers=(Reviewer(REV, "scope"), Reviewer("UREV2", "code")), require_signoffs=True)
+    w = World(cfg=cfg)
+    w.to_audit()
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="dismissed")
+    assert w.state.audit_scopes["scope"]["signed_at"] is None and REV not in w.state.signoffs  # nothing to take back
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="approve")
+    n = len(w.state.findings)
+    w.ev("sign_off", sender=REV, pr=PR, sha="fedcba9", verdict="dismissed")
+    assert w.state.audit_scopes["scope"]["verdict"] == "approve" and len(w.state.findings) == n  # another head: no reopen, no noise
+    w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict="dismissed")
+    assert w.state.audit_scopes["scope"]["verdict"] == "dismissed"
+    w.ev("sign_off", sender="UREV2", pr=PR, sha=SHA, verdict="approve")
+    assert w.state.stage == "Explore" and w.state.iteration == 2 and w.state.audit["verdict"] == "return" and "scope=dismissed" in w.state.findings[n]
+    w = World(cfg=cfg)  # a new approval after the withdrawal passes again
+    w.to_audit()
+    for verdict in ("approve", "dismissed", "approve"): w.ev("sign_off", sender=REV, pr=PR, sha=SHA, verdict=verdict)
+    w.ev("sign_off", sender="UREV2", pr=PR, sha=SHA, verdict="approve")
+    assert w.state.stage == "Delivered" and w.state.audit["verdict"] == "pass"

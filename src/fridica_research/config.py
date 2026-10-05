@@ -42,6 +42,24 @@ class Board:
 
 
 @dataclass(frozen=True)
+class GitHub:
+    """R21/R24 GitHub sign-off (opt-in): review requests, review polling, the mirror line, post-merge acknowledgement."""
+    enabled: bool = False
+    token_env: str = "GH_TOKEN"
+    poll_interval: float = 120.0  # seconds between `gh pr view` polls of one PR
+    post_merge_window: float = 7 * 86400.0  # keep polling a merged PR this long for late reviews
+    bots: tuple[str, ...] = ("copilot", "copilot-pull-request-reviewer", "github-actions")  # never count; any `*[bot]` login too
+
+
+@dataclass(frozen=True)
+class Repo:
+    """R23 `[repos]`: one entry per repository the driver may touch; `merge = "driver"` lets the driver squash-merge."""
+    name: str  # owner/name
+    merge: str = "owner"  # driver | owner
+    reviewers: tuple[str, ...] = ()  # GitHub logins requested on every PR; empty -> the [audit] reviewers' logins
+
+
+@dataclass(frozen=True)
 class Config:
     socket: str = "~/.local/state/fridica/control.sock"
     capability_file: str | None = None
@@ -65,6 +83,8 @@ class Config:
     require_signoffs: bool = True
     people: dict[str, str] = field(default_factory=dict)  # Slack user id -> GitHub login
     llm_model: str = "haiku"
+    github: GitHub = field(default_factory=GitHub)
+    repos: tuple[Repo, ...] = ()
 
     @property
     def socket_path(self) -> Path: return Path(os.path.expanduser(self.socket))
@@ -74,6 +94,20 @@ class Config:
         for r in self.reviewers:
             if r.handle == slack_id and r.login: return r.login
         return self.people.get(slack_id) or (learned or {}).get(slack_id, "")
+
+    def slack_of(self, login: str, learned: dict | None = None) -> str:
+        """The inverse of `login_of` (case-insensitive, as GitHub logins are): "" when no Slack id maps to the login."""
+        low = login.lower()
+        for r in self.reviewers:
+            if r.login.lower() == low: return r.handle
+        for table in (self.people, learned or {}):
+            for slack, lg in table.items():
+                if str(lg).lower() == low: return slack
+        return ""
+
+    def repo(self, name: str) -> Repo:
+        """The `[repos]` entry for `owner/name`; a repository not listed is merged by its owner."""
+        return next((r for r in self.repos if r.name.lower() == name.lower()), Repo(name))
 
     def uncovered_scopes(self) -> tuple[str, ...]:
         """Audit scopes no peer reviewer takes: the local auditor's work (R13). No scopes at all -> one local audit."""
@@ -90,6 +124,10 @@ class Config:
         d = dict(d)
         d["board"] = Board(**d.get("board", {}))
         d["reviewers"] = tuple(Reviewer(**r) for r in d.get("reviewers", ()))
+        g = dict(d.get("github", {}))
+        if "bots" in g: g["bots"] = tuple(g["bots"])
+        d["github"] = GitHub(**g)
+        d["repos"] = tuple(Repo(r["name"], r.get("merge", "owner"), tuple(r.get("reviewers", ()))) for r in d.get("repos", ()))
         for k in ("channels", "starters", "audit_scopes"): d[k] = tuple(d.get(k, ()))
         return cls(**d)
 
@@ -104,6 +142,8 @@ def parse(text: str) -> Config:
     b = raw.get("board", {})
     a = raw.get("audit", {})
     reviewers = tuple(_reviewer(r) for r in a.get("reviewers", []))
+    g = raw.get("github", {})
+    repos = tuple(_repo(name, r) for name, r in raw.get("repos", {}).items())
     scopes = tuple(a.get("scopes", [])) or tuple(dict.fromkeys(r.focus for r in reviewers if r.focus))
     return Config(
         socket=f.get("socket", Config.socket), capability_file=f.get("capability_file"), owner=str(f.get("owner", "")),
@@ -117,12 +157,20 @@ def parse(text: str) -> Config:
         board=Board(bool(b.get("enabled", False)), str(b.get("owner", "")), int(b.get("number", 0)), str(b.get("repo", "")), str(b.get("token_env", "GH_TOKEN")), str(b.get("owner_type", "user"))),
         reviewers=reviewers, audit_scopes=scopes, require_signoffs=bool(a.get("require_signoffs", True)),
         people={str(k): str(v) for k, v in raw.get("people", {}).items()}, llm_model=str(raw.get("llm_model", "haiku")),
+        github=GitHub(bool(g.get("enabled", False)), str(g.get("token_env", "GH_TOKEN")), duration(g.get("poll_interval"), 120.0), duration(g.get("post_merge_window"), 7 * 86400.0), tuple(str(x) for x in g.get("bots", GitHub.bots))),
+        repos=repos,
     )
 
 
 def _reviewer(r) -> Reviewer:
     if not isinstance(r, dict): return Reviewer(str(r))
     return Reviewer(str(r.get("handle") or r.get("slack") or ""), str(r.get("scope") or r.get("focus") or ""), str(r.get("login", "")))
+
+
+def _repo(name: str, r: dict) -> Repo:
+    merge = str(r.get("merge", "owner"))
+    if merge not in ("driver", "owner"): raise ValueError(f"[repos] {name}: merge must be \"driver\" or \"owner\", not {merge!r}")
+    return Repo(str(name), merge, tuple(str(x) for x in r.get("reviewers", [])))
 
 
 def load(path: str | Path | None = None) -> Config:

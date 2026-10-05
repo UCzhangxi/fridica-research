@@ -33,6 +33,7 @@ OVERRUN_FACTOR = 2.0
 PERSISTENT = ("mathematician", "physicist", "implementer")
 SLOT_CODES = ("too_many_workers", "worker_limit", "too many persistent workers")
 MAX_POST_TRIES = 3  # posts of the same text before a rate-limit/failure refusal becomes a stage failure (rule R)
+REOPEN = ("changes", "dismissed")  # scope verdicts that keep the audit from passing: a changes request, or a withdrawn approval
 
 
 @dataclass(frozen=True)
@@ -365,16 +366,23 @@ class M:
             self.peer_post()
             return
         if k == "sign_off":
+            withdrawn = ev["verdict"] == "dismissed"  # GitHub no longer counts an approval it mirrored (github.py); never from Slack
             if not head_matches(ev.get("pr", ""), ev.get("sha", ""), s.implementer.get("pr", ""), s.implementer.get("sha", "")):
                 # A sign-off names the head it reviewed; one for another PR or sha is noted, never counted.
-                s.findings.append(f"iteration {s.iteration} sign-off from {ev['sender']} ignored: {ev.get('pr')} {ev.get('sha')} is not the reviewed head {s.implementer.get('pr') or 'none'} {s.implementer.get('sha') or 'none'}")
+                if not withdrawn: s.findings.append(f"iteration {s.iteration} sign-off from {ev['sender']} ignored: {ev.get('pr')} {ev.get('sha')} is not the reviewed head {s.implementer.get('pr') or 'none'} {s.implementer.get('sha') or 'none'}")
                 return
-            s.signoffs[ev["sender"]] = ev["verdict"]
+            reopened = False
             for sc in s.audit_scopes.values():
-                if sc["reviewer"] == ev["sender"] and sc["signed_at"] is None: sc.update(verdict=ev["verdict"], signed_at=ev.now)
+                # before delivery a later verdict on the reviewed head replaces the earlier one: a `changes` after an approval reopens the scope,
+                # and so does a withdrawn approval (it only ever takes back an approval, never signs an open scope)
+                if sc["reviewer"] == ev["sender"] and (sc["verdict"] == "approve" and s.stage in ("Audit", "Deliver") if withdrawn else sc["signed_at"] is None or (s.stage in ("Audit", "Deliver") and sc["verdict"] != ev["verdict"])):
+                    reopened |= sc["signed_at"] is not None and ev["verdict"] in REOPEN
+                    sc.update(verdict=ev["verdict"], signed_at=ev.now)
+            if not withdrawn or reopened: s.signoffs[ev["sender"]] = ev["verdict"]
             self.mirror_scopes()
             self.board()
             if s.stage == "Audit" and s.phase == "signoff": self.check_signoffs()
+            elif s.stage == "Deliver" and reopened: self.return_for_changes()  # the audit no longer passes; not after Delivered (R24 carries it)
             return
         if k == "finding":
             # R12: changes that arrive while a stage runs never reach the running worker; they are findings for this iteration.
@@ -462,7 +470,7 @@ class M:
     def return_for_changes(self) -> bool:
         s = self.s
         peers = [sc for sc in s.audit_scopes.values() if sc["reviewer"]]
-        if not any(sc["verdict"] == "changes" for sc in peers): return False
+        if not any(sc["verdict"] in REOPEN for sc in peers): return False
         s.audit["verdict"] = "return"
         self.cancel_all()
         self.next_iteration(f"iteration {s.iteration} peer review asked for changes: " + ", ".join(f"{scope}={sc['verdict']}" for scope, sc in sorted(s.audit_scopes.items()) if sc["reviewer"]))
@@ -661,11 +669,16 @@ class M:
         self.pick()
 
 
+MIN_SHA = 7  # the shortest sha prefix that names a head
+
+
 def head_matches(pr: str, sha: str, reviewed_pr: str, reviewed_sha: str) -> bool:
-    """A sign-off counts only for the reviewed head: the same PR (URL, `#N` or `N`) and a prefix of the same sha; an unknown head cannot be matched and is accepted."""
-    def pr_id(x: str) -> str: return str(x).strip().rstrip("/").rsplit("/", 1)[-1].lstrip("#")
-    pr_ok = not reviewed_pr or pr_id(pr) == pr_id(reviewed_pr)
-    sha_ok = not reviewed_sha or (bool(sha) and reviewed_sha.lower().startswith(str(sha).lower()))
+    """A sign-off counts only for the reviewed head: the same PR (URL, `owner/repo#N`, `#N` or `N`; the repository
+    is compared whenever both names carry one) and the same sha, either side abbreviated to at least 7 hex digits;
+    an unknown head cannot be matched and is accepted."""
+    pr_ok = not reviewed_pr or contracts.same_pr(pr, reviewed_pr)
+    a, b = sorted((str(sha).strip().lower(), str(reviewed_sha).strip().lower()), key=len)
+    sha_ok = not reviewed_sha or (len(a) >= MIN_SHA and b.startswith(a))
     return pr_ok and sha_ok
 
 
