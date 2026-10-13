@@ -104,6 +104,11 @@ def corpora(path: Path) -> list[Path]:
     return sorted(p for p in path.iterdir() if is_corpus(p))
 
 
+def corpus_names(path: Path) -> list[str]:
+    """The directory names of the corpora under `path`, sorted."""
+    return sorted(p.name for p in corpora(path))
+
+
 def leaks(dir_: Path) -> list[str]:
     """Token-like strings in any corpus file: a corpus is checked in, so it must be redaction-clean."""
     out = []

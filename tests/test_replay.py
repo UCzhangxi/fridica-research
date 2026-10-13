@@ -86,6 +86,14 @@ def test_structural_beats_added_field_beats_textual(monkeypatch):
     assert replay.replay(ROOT / "001_simple_research").corpora[0].cls == "D2"
 
 
+def test_corpus_names_are_sorted(tmp_path):
+    for name in ("b_second", "a_first"): shutil.copytree(ROOT / "001_simple_research", tmp_path / name)
+    (tmp_path / "not_a_corpus").mkdir()
+    assert replay.corpus_names(tmp_path) == ["a_first", "b_second"]
+    assert replay.corpus_names(tmp_path / "b_second") == ["b_second"]
+    assert replay.corpus_names(ROOT) == CORPORA
+
+
 def test_token_like_text_fails_the_corpus(tmp_path):
     dst = tmp_path / "leaky"
     shutil.copytree(ROOT / "001_simple_research", dst)
